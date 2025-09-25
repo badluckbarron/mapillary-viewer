@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>MapillaryJS – image + map (split or toggle)</title>
+  <title>MapillaryJS – image + map (with user pins)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -46,6 +46,8 @@
       username: (qs.get("username") || "HKocen").trim()
     };
     const VIEW = (qs.get("view") || "image").toLowerCase(); // image | map | split
+    const SHOW_PINS = (qs.get("pins") || "").toLowerCase() === "all"; // pins=all to draw all images in view
+
     const status = (t) => { document.getElementById('msg').textContent = t || ""; };
 
     // Set layout
@@ -55,7 +57,7 @@
     // Rough map zoom -> search radius (meters)
     const zoomToMeters = (z) => 500000 / Math.pow(2, z);
 
-    // --- Leaflet map (always available; doesn’t need token) ---
+    // --- Leaflet map ---
     const map = L.map('map', { zoomControl: true, attributionControl: true });
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
@@ -65,9 +67,18 @@
     const startLatLng = [defaults.lat, defaults.lng];
     map.setView(startLatLng, 13);
 
-    let marker = L.marker(startLatLng, { draggable: false }).addTo(map);
+    const marker = L.marker(startLatLng, { draggable: false }).addTo(map);
+    const pinLayer = L.layerGroup().addTo(map);  // holds all user image points
 
-    // --- Mapillary helper: find nearest image for user near lat/lng ---
+    // --- Mapillary helpers ---
+    function bboxFromMap(m) {
+      const b = m.getBounds();
+      const sw = b.getSouthWest(); // lat,lng
+      const ne = b.getNorthEast();
+      // API expects bbox = minLon,minLat,maxLon,maxLat
+      return [sw.lng, sw.lat, ne.lng, ne.lat];
+    }
+
     async function findImageNear({lat, lng}) {
       const url = new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields", "id,sequence_id,computed_geometry");
@@ -82,7 +93,63 @@
       return data?.data?.[0] ?? null;
     }
 
-    // --- Map click: jump viewer to nearest image for that user ---
+    // Fetch ALL images for the username within current bbox (paged)
+    async function fetchImagesInBbox({bbox, cap=3000}) {
+      const base = "https://graph.mapillary.com/images";
+      let url = new URL(base);
+      url.searchParams.set("fields", "id,computed_geometry");
+      url.searchParams.set("bbox", bbox.join(","));
+      url.searchParams.set("limit", "100"); // page size
+      if (defaults.username) url.searchParams.set("creator_username", defaults.username);
+
+      const out = [];
+      while (url && out.length < cap) {
+        const res = await fetch(url, { headers: { Authorization: `OAuth ${TOKEN}` }});
+        if (!res.ok) throw new Error(`API error ${res.status}`);
+        const j = await res.json();
+        if (Array.isArray(j.data)) out.push(...j.data);
+        const next = j?.paging?.next;
+        if (!next) break;
+        url = new URL(next);
+      }
+      return out;
+    }
+
+    // Draw pins for all images in bbox
+    async function drawPinsForView() {
+      if (!TOKEN || !SHOW_PINS) return;
+      const bbox = bboxFromMap(map);
+      status("Loading user pins in view…");
+      try {
+        const images = await fetchImagesInBbox({ bbox });
+        pinLayer.clearLayers();
+        for (const img of images) {
+          const coords = img?.computed_geometry?.coordinates; // [lon, lat]
+          if (!coords) continue;
+          const latlng = [coords[1], coords[0]];
+          const c = L.circleMarker(latlng, { radius: 3, weight: 1, opacity: 0.9, fillOpacity: 0.6 });
+          c.on('click', () => {
+            // If viewer exists, move to this image
+            if (viewer) { viewer.moveTo(img.id); }
+          });
+          c.addTo(pinLayer);
+        }
+        status(images.length ? `Pins: ${images.length}` : "No images in view for this user.");
+      } catch (e) {
+        console.error(e);
+        status("Error loading pins.");
+      }
+    }
+
+    // Re-query pins when you pan/zoom (debounced)
+    let pinTimer = null;
+    map.on('moveend', () => {
+      if (!SHOW_PINS) return;
+      clearTimeout(pinTimer);
+      pinTimer = setTimeout(drawPinsForView, 350);
+    });
+
+    // Map click -> jump to nearest image
     map.on('click', async (e) => {
       if (!TOKEN) { status("Add ?token=... to enable image navigation."); return; }
       try {
@@ -104,12 +171,11 @@
     let viewer = null;
     (async function init(){
       if (!TOKEN) {
-        status("Map only: add ?view=split (or image) and ?token=YOUR_TOKEN to enable the viewer.");
-        // still show the map centered where requested
+        status(SHOW_PINS ? "Add ?token=YOUR_TOKEN to enable navigation; pins will not load without a token." :
+                           "Map only: add ?view=split (or image) and ?token=YOUR_TOKEN to enable the viewer.");
         return;
       }
 
-      // Create viewer
       const M = window.Mapillary || window.mapillary || window.mapillaryjs;
       const ViewerCtor = M && M.Viewer;
       if (!ViewerCtor) { status("Mapillary library failed to load."); return; }
@@ -124,14 +190,14 @@
         await viewer.moveTo(start.id);
         status("");
 
-        // Keep navigation to that user's imagery (fallback to starting sequence)
+        // Keep navigation to that user's imagery (fallback to sequence)
         try { await viewer.setFilter(["==", "creatorUsername", defaults.username]); }
-        catch { await viewer.setFilter(["in", "sequenceId", start.sequence_id]); }
+        catch { /* ignore if property not available */ }
 
         viewer.setFieldOfView(45); // optional “zoom”
 
-        // --- Sync map when the current image changes ---
-        const updateMapToCurrent = async (imageId) => {
+        // Sync map to current image
+        async function syncMap(imageId) {
           try {
             const url = new URL(`https://graph.mapillary.com/${imageId}`);
             url.searchParams.set("fields", "computed_geometry");
@@ -145,27 +211,27 @@
               if (VIEW !== 'image') map.setView(latlng, map.getZoom(), { animate: true });
             }
           } catch {}
-        };
+        }
 
-        // Fire once for starting image
-        await updateMapToCurrent(start.id);
+        await syncMap(start.id);
 
-        // Listen for subsequent image changes
         try {
           viewer.on('image', (ev) => {
             const id = ev?.image?.id || ev?.imageId || ev?.id;
-            if (id) updateMapToCurrent(id);
+            if (id) syncMap(id);
           });
         } catch {
-          // If event name differs in your MJS version, poll as a fallback:
           setInterval(async () => {
             try {
               const state = await viewer.getState?.();
               const id = state?.imageId;
-              if (id) updateMapToCurrent(id);
+              if (id) syncMap(id);
             } catch {}
           }, 1500);
         }
+
+        // Initial pins load (if requested)
+        if (SHOW_PINS) drawPinsForView();
 
       } catch (e) {
         console.error(e);
