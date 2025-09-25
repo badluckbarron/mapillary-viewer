@@ -47,7 +47,6 @@
     };
     const VIEW = (qs.get("view") || "image").toLowerCase(); // image | map | split
     const SHOW_PINS = (qs.get("pins") || "").toLowerCase() === "all"; // pins=all to draw all images in view
-
     const status = (t) => { document.getElementById('msg').textContent = t || ""; };
 
     // Set layout
@@ -93,10 +92,9 @@
       return data?.data?.[0] ?? null;
     }
 
-    // Fetch ALL images for the username within current bbox (paged)
+    // Fetch images for the username within current bbox (paged)
     async function fetchImagesInBbox({bbox, cap=3000}) {
-      const base = "https://graph.mapillary.com/images";
-      let url = new URL(base);
+      let url = new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields", "id,computed_geometry");
       url.searchParams.set("bbox", bbox.join(","));
       url.searchParams.set("limit", "100"); // page size
@@ -129,8 +127,7 @@
           const latlng = [coords[1], coords[0]];
           const c = L.circleMarker(latlng, { radius: 3, weight: 1, opacity: 0.9, fillOpacity: 0.6 });
           c.on('click', () => {
-            // If viewer exists, move to this image
-            if (viewer) { viewer.moveTo(img.id); }
+            if (viewer) gotoImage(img.id);   // <-- use helper so we don't get sequence-locked
           });
           c.addTo(pinLayer);
         }
@@ -156,7 +153,7 @@
         status("Finding image near map click…");
         const img = await findImageNear({ lat: e.latlng.lat, lng: e.latlng.lng });
         if (img) {
-          await viewer.moveTo(img.id);
+          await gotoImage(img.id);          // <-- use helper (no sequence fallback)
           status("");
         } else {
           status("No image found near that point for this user.");
@@ -169,6 +166,18 @@
 
     // --- Mapillary viewer (only if token present) ---
     let viewer = null;
+
+    // Helper: move to any image and keep (optional) username filter only
+    async function gotoImage(id) {
+      try {
+        // Prefer a username filter so you can roam across all of that user's sequences
+        await viewer.setFilter(["==", "creatorUsername", defaults.username]);
+      } catch (e) {
+        // If not supported in this build, leave it unfiltered (no sequence lock)
+      }
+      await viewer.moveTo(id);
+    }
+
     (async function init(){
       if (!TOKEN) {
         status(SHOW_PINS ? "Add ?token=YOUR_TOKEN to enable navigation; pins will not load without a token." :
@@ -187,12 +196,8 @@
         const start = await findImageNear({ lat: defaults.lat, lng: defaults.lng });
         if (!start) { status(`No imagery by "${defaults.username}" near ${defaults.lat.toFixed(5)}, ${defaults.lng.toFixed(5)}.`); return; }
 
-        await viewer.moveTo(start.id);
+        await gotoImage(start.id);  // <-- use helper (no sequence fallback)
         status("");
-
-        // Keep navigation to that user's imagery (fallback to sequence)
-        try { await viewer.setFilter(["==", "creatorUsername", defaults.username]); }
-        catch { /* ignore if property not available */ }
 
         viewer.setFieldOfView(45); // optional “zoom”
 
@@ -221,6 +226,7 @@
             if (id) syncMap(id);
           });
         } catch {
+          // Fallback polling if event not available
           setInterval(async () => {
             try {
               const state = await viewer.getState?.();
