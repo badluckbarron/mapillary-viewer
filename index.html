@@ -131,7 +131,7 @@
       let url = new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields", "id,computed_geometry");
       url.searchParams.set("bbox", bbox.join(","));
-      url.searchParams.set("limit", "100");
+      url.searchParams.set("limit", "500");
       if (defaults.username) url.searchParams.set("creator_username", defaults.username);
       const out = [];
       while (url && out.length < cap) {
