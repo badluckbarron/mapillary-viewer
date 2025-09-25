@@ -4,31 +4,22 @@
   <meta charset="utf-8" />
   <title>MapillaryJS – compass-synced wedge (calibrated + tunable)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-
-  <!-- MapillaryJS -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.css" />
   <script src="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.min.js"></script>
-
-  <!-- Leaflet -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-
   <style>
-    html, body { height: 100%; margin: 0; }
-    #wrap { height: 100vh; width: 100%; }
-    #mly, #map { height: 100%; width: 100%; }
-    #msg { position: absolute; top: 8px; left: 8px; z-index: 1000;
-           background: rgba(0,0,0,0.6); color: #fff; padding: 6px 10px; border-radius: 6px;
-           font: 13px/1.4 system-ui, sans-serif; }
-    #dbg { position: absolute; top: 8px; right: 8px; z-index: 1000;
-           background: rgba(20,20,20,0.72); color: #9ef; padding: 6px 10px; border-radius: 6px;
-           font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; display:none; }
-    .image-only { display: block; position: relative; }
-    .image-only #map { display: none; }
-    .map-only   { display: block; }
-    .map-only   #mly { display: none; }
-    .split      { display: grid; grid-template-columns: 1fr 1fr; }
-    .split #mly, .split #map { display: block; }
+    html, body { height:100%; margin:0; }
+    #wrap { height:100vh; width:100%; }
+    #mly, #map { height:100%; width:100%; }
+    #msg { position:absolute; top:8px; left:8px; z-index:1000; background:rgba(0,0,0,.6); color:#fff; padding:6px 10px; border-radius:6px; font:13px/1.4 system-ui,sans-serif; }
+    #dbg { position:absolute; top:8px; right:8px; z-index:1000; background:rgba(20,20,20,.72); color:#9ef; padding:6px 10px; border-radius:6px; font:12px/1.35 ui-monospace,Menlo,Consolas,monospace; display:none; }
+    .image-only { display:block; position:relative; }
+    .image-only #map { display:none; }
+    .map-only { display:block; }
+    .map-only #mly { display:none; }
+    .split { display:grid; grid-template-columns:1fr 1fr; }
+    .split #mly, .split #map { display:block; }
   </style>
 </head>
 <body>
@@ -40,7 +31,7 @@
   </div>
 
   <script>
-    // ---------------- Query params / options ----------------
+    // -------- Query params / options --------
     const qs = new URLSearchParams(location.search);
     const TOKEN = qs.get("token") || "";
     const defaults = {
@@ -49,153 +40,127 @@
       z:   Number(qs.get("z")   ?? 12),
       username: (qs.get("username") || "HKocen").trim()
     };
-    const VIEW      = (qs.get("view") || "image").toLowerCase();   // image | map | split
+    const VIEW      = (qs.get("view") || "image").toLowerCase();  // image | map | split
     const SHOW_PINS = (qs.get("pins") || "").toLowerCase() === "all";
-    const FOV_DEG   = Number(qs.get("fov") ?? 60);                 // wedge width (static)
+    const FOV_DEG   = Number(qs.get("fov") ?? 60);                // wedge width
     const DEBUG     = qs.get("debug") === "1";
     const MAX_PINS  = Number(qs.get("maxPins") ?? 1500);
 
     // Tunables for compass -> bearing mapping
-    const COMPASS_SRC    = (qs.get("compassSrc") || "north").toLowerCase(); // 'north' | 'bg'
-    const COMPASS_SIGN   = qs.get("compassSign") === "+1" ? +1 : -1;        // +1 or -1
-    const BEARING_OFFSET = Number(qs.get("bearingOffset") ?? 0);            // degrees
+    const COMPASS_SRC    = (qs.get("compassSrc") || "north").toLowerCase();   // 'north' | 'bg'
+    const COMPASS_SIGN   = qs.get("compassSign") === "+1" ? +1 : -1;          // +1 or -1
+    const BEARING_OFFSET = Number(qs.get("bearingOffset") ?? 0);              // degrees
+    const DELTA_FORMULA  = (qs.get("deltaFormula") || "rotMinusAnchor").toLowerCase(); // 'rotMinusAnchor' | 'anchorMinusRot'
 
-    const status = (t) => { document.getElementById('msg').textContent = t || ""; };
-    const dbg    = (t) => { const el = document.getElementById('dbg'); if (DEBUG) { el.style.display='block'; el.textContent = t; } };
+    const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
+    const dbg    = (t)=>{ const el = document.getElementById('dbg'); if (DEBUG){ el.style.display='block'; el.textContent=t; } };
 
-    // ---------------- Layout ----------------
+    // -------- Layout --------
     const wrap = document.getElementById('wrap');
     wrap.className = VIEW === 'split' ? 'split' : (VIEW === 'map' ? 'map-only' : 'image-only');
 
-    // ---------------- Map ----------------
-    const map = L.map('map', { zoomControl: true, attributionControl: true });
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
-    }).addTo(map);
+    // -------- Map --------
+    const map = L.map('map', { zoomControl:true, attributionControl:true });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:19, attribution:'&copy; OpenStreetMap contributors' }).addTo(map);
     const startLatLng = [defaults.lat, defaults.lng];
     map.setView(startLatLng, 13);
-
-    const marker = L.marker(startLatLng, { draggable: false }).addTo(map);
+    const marker = L.marker(startLatLng, { draggable:false }).addTo(map);
     const pinLayer = L.layerGroup().addTo(map);
     const orientationLayer = L.layerGroup().addTo(map);
 
-    // Pin style
-    const defaultPinStyle = {
-      radius: 4, color: '#1b5e20', weight: 2, opacity: 1,
-      fillColor: '#2ecc71', fillOpacity: 0.9, className: 'pin'
-    };
+    const defaultPinStyle = { radius:4, color:'#1b5e20', weight:2, opacity:1, fillColor:'#2ecc71', fillOpacity:.9, className:'pin' };
 
-    // ---------------- Helpers ----------------
-    function zoomToMeters(z) { return 500000 / Math.pow(2, z); }
-    function bboxFromMap(m) { const b = m.getBounds(), sw = b.getSouthWest(), ne = b.getNorthEast(); return [sw.lng, sw.lat, ne.lng, ne.lat]; }
-    function norm360(x) { return ((x % 360) + 360) % 360; }
-
-    function destPoint(lat, lng, bearingDeg, meters) {
-      const R = 6371000, br = bearingDeg * Math.PI / 180;
-      const φ1 = lat * Math.PI / 180, λ1 = lng * Math.PI / 180, δ = meters / R;
-      const φ2 = Math.asin(Math.sin(φ1) * Math.cos(δ) + Math.cos(φ1) * Math.sin(δ) * Math.cos(br));
-      const λ2 = λ1 + Math.atan2(Math.sin(br) * Math.sin(δ) * Math.cos(φ1),
-                                  Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2));
-      return [φ2 * 180 / Math.PI, ((λ2 * 180 / Math.PI + 540) % 360) - 180];
+    // -------- Helpers --------
+    function zoomToMeters(z){ return 500000 / Math.pow(2,z); }
+    function bboxFromMap(m){ const b=m.getBounds(), sw=b.getSouthWest(), ne=b.getNorthEast(); return [sw.lng, sw.lat, ne.lng, ne.lat]; }
+    function norm360(x){ return ((x%360)+360)%360; }
+    function destPoint(lat,lng,bearingDeg,meters){
+      const R=6371000, br=bearingDeg*Math.PI/180;
+      const φ1=lat*Math.PI/180, λ1=lng*Math.PI/180, δ=meters/R;
+      const φ2=Math.asin(Math.sin(φ1)*Math.cos(δ)+Math.cos(φ1)*Math.sin(δ)*Math.cos(br));
+      const λ2=λ1+Math.atan2(Math.sin(br)*Math.sin(δ)*Math.cos(φ1), Math.cos(δ)-Math.sin(φ1)*Math.sin(φ2));
+      return [φ2*180/Math.PI, ((λ2*180/Math.PI+540)%360)-180];
     }
-
-    function drawOrientation(lat, lng, bearingDeg, fovDeg = FOV_DEG, length = 50) {
+    function drawOrientation(lat,lng,bearingDeg,fovDeg=FOV_DEG,length=50){
       orientationLayer.clearLayers();
-      if (typeof bearingDeg !== 'number') return;
-      const left  = bearingDeg - fovDeg / 2;
-      const right = bearingDeg + fovDeg / 2;
-      const tip   = destPoint(lat, lng, bearingDeg, length);
-      const pLeft = destPoint(lat, lng, left, length);
-      const pRight= destPoint(lat, lng, right, length);
-      L.polygon([[lat, lng], pLeft, pRight], { color:'#1976d2', weight:1, fillColor:'#1976d2', fillOpacity:0.18 }).addTo(orientationLayer);
-      L.polyline([[lat, lng], tip], { color:'#1976d2', weight:2, opacity:0.9 }).addTo(orientationLayer);
+      if(typeof bearingDeg!=='number') return;
+      const left=bearingDeg-fovDeg/2, right=bearingDeg+fovDeg/2;
+      const tip=destPoint(lat,lng,bearingDeg,length);
+      const pLeft=destPoint(lat,lng,left,length);
+      const pRight=destPoint(lat,lng,right,length);
+      L.polygon([[lat,lng],pLeft,pRight],{color:'#1976d2',weight:1,fillColor:'#1976d2',fillOpacity:.18}).addTo(orientationLayer);
+      L.polyline([[lat,lng],tip],{color:'#1976d2',weight:2,opacity:.9}).addTo(orientationLayer);
     }
 
-    // ---------------- Graph API ----------------
-    async function findImageNear({lat, lng}) {
-      const url = new URL("https://graph.mapillary.com/images");
+    // -------- Graph API --------
+    async function findImageNear({lat,lng}){
+      const url=new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields","id,computed_geometry");
-      url.searchParams.set("closeto", `${lng},${lat}`);
-      url.searchParams.set("radius", Math.max(25, Math.round(zoomToMeters(defaults.z))));
+      url.searchParams.set("closeto",`${lng},${lat}`);
+      url.searchParams.set("radius",Math.max(25,Math.round(zoomToMeters(defaults.z))));
       url.searchParams.set("limit","1");
-      if (defaults.username) url.searchParams.set("creator_username", defaults.username);
-      const res = await fetch(url, { headers:{ Authorization:`OAuth ${TOKEN}` }});
-      if (!res.ok) throw new Error(`API ${res.status}`);
-      const j = await res.json();
-      return j?.data?.[0] ?? null;
+      if(defaults.username) url.searchParams.set("creator_username",defaults.username);
+      const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}}); if(!res.ok) throw new Error(`API ${res.status}`);
+      const j=await res.json(); return j?.data?.[0] ?? null;
     }
 
-    async function fetchImagesInBbox({bbox, cap = MAX_PINS}) {
-      const PAGE = 100; // API per-page max
-      let out = [];
-      let url = new URL("https://graph.mapillary.com/images");
+    async function fetchImagesInBbox({bbox, cap=MAX_PINS}){
+      const PAGE=100; let out=[];
+      let url=new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields","id,computed_geometry");
-      url.searchParams.set("bbox", bbox.join(","));
-      url.searchParams.set("limit", String(Math.min(PAGE, cap)));
-      if (defaults.username) url.searchParams.set("creator_username", defaults.username);
-
-      while (url && out.length < cap) {
-        const res = await fetch(url, { headers:{ Authorization:`OAuth ${TOKEN}` }});
-        if (!res.ok) throw new Error(`API ${res.status}`);
-        const j = await res.json();
-        if (Array.isArray(j.data)) out.push(...j.data);
-        const next = j?.paging?.next;
-        if (!next || out.length >= cap) break;
-        url = new URL(next);
-        url.searchParams.set("limit", String(Math.min(PAGE, cap - out.length)));
+      url.searchParams.set("bbox",bbox.join(","));
+      url.searchParams.set("limit", String(Math.min(PAGE,cap)));
+      if(defaults.username) url.searchParams.set("creator_username",defaults.username);
+      while(url && out.length<cap){
+        const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}}); if(!res.ok) throw new Error(`API ${res.status}`);
+        const j=await res.json(); if(Array.isArray(j.data)) out.push(...j.data);
+        const next=j?.paging?.next; if(!next || out.length>=cap) break;
+        url=new URL(next); url.searchParams.set("limit", String(Math.min(PAGE, cap-out.length)));
       }
-      return out.slice(0, cap);
+      return out.slice(0,cap);
     }
 
-    async function drawPinsForView() {
-      if (!TOKEN || !SHOW_PINS) return;
+    async function drawPinsForView(){
+      if(!TOKEN || !SHOW_PINS) return;
       status("Loading user pins in view…");
-      try {
-        const images = await fetchImagesInBbox({ bbox: bboxFromMap(map) });
+      try{
+        const images=await fetchImagesInBbox({bbox:bboxFromMap(map)});
         pinLayer.clearLayers();
-        for (const img of images) {
-          const c = img?.computed_geometry?.coordinates; if (!c) continue;
-          const latlng = [c[1], c[0]];
+        for(const img of images){
+          const c=img?.computed_geometry?.coordinates; if(!c) continue;
+          const latlng=[c[1],c[0]];
           L.circleMarker(latlng, defaultPinStyle)
-            .on("click", (e) => { L.DomEvent.stop(e); if (viewer) gotoImage(img.id, latlng); })
+            .on('click', e => { L.DomEvent.stop(e); if(viewer) gotoImage(img.id, latlng); })
             .addTo(pinLayer);
         }
         status(`Pins: ${images.length}`);
-      } catch (e) { console.error(e); status("Error loading pins."); }
+      }catch(e){ console.error(e); status("Error loading pins."); }
     }
 
-    let pinTimer = null;
-    map.on('moveend', () => {
-      if (!SHOW_PINS) return;
-      clearTimeout(pinTimer);
-      pinTimer = setTimeout(drawPinsForView, 350);
-    });
-
-    map.on('click', async (e) => {
-      if (!TOKEN) { status("Add ?token=..."); return; }
-      try {
+    let pinTimer=null;
+    map.on('moveend', ()=>{ if(!SHOW_PINS) return; clearTimeout(pinTimer); pinTimer=setTimeout(drawPinsForView,350); });
+    map.on('click', async (e)=>{
+      if(!TOKEN){ status("Add ?token=..."); return; }
+      try{
         status("Finding image near click…");
-        const img = await findImageNear({ lat: e.latlng.lat, lng: e.latlng.lng });
-        if (img) { await gotoImage(img.id, [e.latlng.lat, e.latlng.lng]); status(""); }
+        const img=await findImageNear({lat:e.latlng.lat,lng:e.latlng.lng});
+        if(img){ await gotoImage(img.id,[e.latlng.lat,e.latlng.lng]); status(""); }
         else status("No image found there.");
-      } catch (err) { console.error(err); status("Error searching."); }
+      }catch(err){ console.error(err); status("Error searching."); }
     });
 
-    // ---------------- Compass → Bearing (calibrated) ----------------
-    let viewer = null, navLock = 0;
-    let compassEl = null;                       // DOM node we read rotation from
-    let anchor = { rot: null, bearing: null };  // per-image calibration { rot0, bearing0 }
+    // -------- Compass → Bearing (calibrated) --------
+    let viewer=null, navLock=0;
+    let compassEl=null;                       // node to read rotation
+    let anchor={ rot:null, bearing:null };    // per-image anchor: rot0, bearing0
 
-    function findCompassEl() {
-      const host = document.getElementById('mly');
-      if (!host) return null;
-
-      if (COMPASS_SRC === 'bg') {
+    function findCompassEl(){
+      const host=document.getElementById('mly'); if(!host) return null;
+      if(COMPASS_SRC==='bg'){
         return host.querySelector('.mapillary-bearing-indicator-container .mapillary-bearing-indicator-background')
             || host.querySelector('.mapillary-bearing-indicator-background')
             || host.querySelector('[class*="bearing-indicator"]');
       }
-      // default: north arrow
       return host.querySelector('.mapillary-bearing-indicator-container .mapillary-bearing-north-container')
           || host.querySelector('.mapillary-bearing-north-container')
           || host.querySelector('[class*="bearing-north"]')
@@ -203,137 +168,124 @@
           || host.querySelector('[class*="compass"]');
     }
 
-    function getRotationDeg(rootEl) {
-      if (!rootEl) return null;
-      const q = [rootEl];
-      let depth = 0, nextBreak = 1, count = 0, maxDepth = 3;
-
-      while (q.length && depth <= maxDepth) {
-        const el = q.shift();
-        const t = getComputedStyle(el).transform || el.style?.transform || '';
-        const deg = parseTransformToDeg(t);
-        if (deg != null) return norm360(deg);
-        for (const child of el.children || []) q.push(child);
-        count++; if (count === nextBreak) { depth++; nextBreak = q.length + count; }
+    function getRotationDeg(rootEl){
+      if(!rootEl) return null;
+      const q=[rootEl]; let depth=0, nextBreak=1, count=0, maxDepth=3;
+      while(q.length && depth<=maxDepth){
+        const el=q.shift();
+        const t=getComputedStyle(el).transform || el.style?.transform || '';
+        const deg=parseTransformToDeg(t); if(deg!=null) return norm360(deg);
+        for(const child of el.children||[]) q.push(child);
+        count++; if(count===nextBreak){ depth++; nextBreak=q.length+count; }
       }
       return null;
-
-      function parseTransformToDeg(transform) {
-        if (!transform || transform === 'none') return null;
-        const r = /rotate[Z]?\(\s*([-+0-9.]+)\s*(deg|rad)\s*\)/i.exec(transform);
-        if (r) return r[2].toLowerCase() === 'rad' ? (+r[1] * 180/Math.PI) : +r[1];
-        const m2 = /^matrix\(\s*([-+0-9eE.,\s]+)\)$/.exec(transform);
-        if (m2) { const [a,b] = m2[1].split(',').map(v=>parseFloat(v)); return Math.atan2(b,a)*180/Math.PI; }
-        const m3 = /^matrix3d\(\s*([-+0-9eE.,\s]+)\)$/.exec(transform);
-        if (m3) { const p = m3[1].split(',').map(v=>parseFloat(v)); return Math.atan2(p[1],p[0])*180/Math.PI; }
+      function parseTransformToDeg(transform){
+        if(!transform || transform==='none') return null;
+        const r=/rotate[Z]?\(\s*([-+0-9.]+)\s*(deg|rad)\s*\)/i.exec(transform);
+        if(r) return r[2].toLowerCase()==='rad' ? (+r[1]*180/Math.PI) : +r[1];
+        const m2=/^matrix\(\s*([-+0-9eE.,\s]+)\)$/.exec(transform);
+        if(m2){ const [a,b]=m2[1].split(',').map(v=>parseFloat(v)); return Math.atan2(b,a)*180/Math.PI; }
+        const m3=/^matrix3d\(\s*([-+0-9eE.,\s]+)\)$/.exec(transform);
+        if(m3){ const p=m3[1].split(',').map(v=>parseFloat(v)); return Math.atan2(p[1],p[0])*180/Math.PI; }
         return null;
       }
     }
 
-    async function readStableCompassRotation(maxWaitMs = 3500) {
-      const t0 = performance.now();
-      let last = null, stableCount = 0, rot = null;
-      while (performance.now() - t0 < maxWaitMs) {
-        if (!compassEl) compassEl = findCompassEl();
-        rot = getRotationDeg(compassEl);
-        if (rot != null) {
-          const diff = Math.abs(((rot - last + 540) % 360) - 180);
-          if (last != null && diff < 0.5) {
-            if (++stableCount >= 3) return rot;  // ~300ms stable
-          } else { stableCount = 0; last = rot; }
+    async function readStableCompassRotation(maxWaitMs=3500){
+      const t0=performance.now(); let last=null, stable=0, rot=null;
+      while(performance.now()-t0<maxWaitMs){
+        if(!compassEl) compassEl=findCompassEl();
+        rot=getRotationDeg(compassEl);
+        if(rot!=null){
+          const diff=Math.abs(((rot-last+540)%360)-180);
+          if(last!=null && diff<0.5){ if(++stable>=3) return rot; }
+          else { stable=0; last=rot; }
         }
-        await new Promise(r => setTimeout(r, 100));
+        await new Promise(r=>setTimeout(r,100));
       }
       return rot;
     }
 
-    async function calibrateBearing(imageId) {
-      try {
-        const url = new URL(`https://graph.mapillary.com/${imageId}`);
+    async function calibrateBearing(imageId){
+      try{
+        const url=new URL(`https://graph.mapillary.com/${imageId}`);
         url.searchParams.set("fields","computed_geometry,computed_compass_angle");
-        const res = await fetch(url, { headers:{ Authorization:`OAuth ${TOKEN}` }});
-        if (!res.ok) return;
-        const j = await res.json();
-        const coords = j?.computed_geometry?.coordinates;
-        const bearing0 = j?.computed_compass_angle;
-
-        if (coords?.length === 2) {
-          const latlng = [coords[1], coords[0]];
+        const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}}); if(!res.ok) return;
+        const j=await res.json();
+        const coords=j?.computed_geometry?.coordinates;
+        const bearing0=j?.computed_compass_angle;
+        if(coords?.length===2){
+          const latlng=[coords[1],coords[0]];
           marker.setLatLng(latlng);
-          if (VIEW !== 'image') map.setView(latlng, map.getZoom(), { animate:true });
+          if(VIEW!=='image') map.setView(latlng, map.getZoom(), {animate:true});
         }
-
-        compassEl = findCompassEl();
-        const rot0 = await readStableCompassRotation();
-
-        if (typeof bearing0 === 'number' && rot0 != null) {
-          anchor = { rot: rot0, bearing: norm360(bearing0) };
-          const latlng = marker.getLatLng();
+        compassEl=findCompassEl();
+        const rot0=await readStableCompassRotation();
+        if(typeof bearing0==='number' && rot0!=null){
+          anchor={ rot:rot0, bearing:norm360(bearing0) };
+          const latlng=marker.getLatLng();
           drawOrientation(latlng.lat, latlng.lng, anchor.bearing, FOV_DEG, 50);
-          if (DEBUG) dbg(`calibrated\napi=${anchor.bearing.toFixed(1)}°\nrot0=${anchor.rot.toFixed(1)}°`);
+          if(DEBUG) dbg(`calibrated\napi=${anchor.bearing.toFixed(1)}°\nrot0=${anchor.rot.toFixed(1)}°`);
         }
-      } catch (e) { console.error(e); }
+      }catch(e){ console.error(e); }
     }
 
-    function startCompassWatcher() {
-      setInterval(() => {
-        if (anchor.rot == null || anchor.bearing == null) return;
-        if (!compassEl) compassEl = findCompassEl();
-        const rot = getRotationDeg(compassEl);
-        if (rot == null) return;
+    function startCompassWatcher(){
+      setInterval(()=>{
+        if(anchor.rot==null || anchor.bearing==null) return;
+        if(!compassEl) compassEl=findCompassEl();
+        const rot=getRotationDeg(compassEl); if(rot==null) return;
 
-        const delta = ((rot - anchor.rot + 540) % 360) - 180;          // signed change
+        // choose delta direction by param
+        const raw = (DELTA_FORMULA==='anchorMinusRot') ? (anchor.rot - rot) : (rot - anchor.rot);
+        const delta = ((raw + 540) % 360) - 180;  // shortest signed change
+
         const bearing = norm360(anchor.bearing + COMPASS_SIGN * delta + BEARING_OFFSET);
 
-        const pos = marker.getLatLng();
+        const pos=marker.getLatLng();
         drawOrientation(pos.lat, pos.lng, bearing, FOV_DEG, 50);
-        if (DEBUG) dbg(`live compass\nrot=${rot.toFixed(1)}°\nΔ=${delta.toFixed(1)}°\nbearing=${bearing.toFixed(1)}°\nsrc=${COMPASS_SRC} sign=${COMPASS_SIGN} off=${BEARING_OFFSET}`);
-      }, 120);
+        if(DEBUG) dbg(`live compass\nrot=${rot.toFixed(1)}°\nΔ=${delta.toFixed(1)}°\nbearing=${bearing.toFixed(1)}°\nsrc=${COMPASS_SRC} sign=${COMPASS_SIGN} off=${BEARING_OFFSET} Δf=${DELTA_FORMULA}`);
+      },120);
     }
 
-    // ---------------- Navigation ----------------
-    async function gotoImage(id, latlngHint) {
-      const myLock = ++navLock;
-      try { await viewer.setFilter(["all"]); } catch {}
-      try {
+    // -------- Navigation --------
+    async function gotoImage(id, latlngHint){
+      const myLock=++navLock;
+      try{ await viewer.setFilter(["all"]); }catch{}
+      try{
         await viewer.moveTo(id);
-        if (latlngHint) {
-          marker.setLatLng([latlngHint[0], latlngHint[1]]);
-          if (VIEW !== 'image') map.setView(latlngHint, map.getZoom(), { animate:true });
+        if(latlngHint){
+          marker.setLatLng([latlngHint[0],latlngHint[1]]);
+          if(VIEW!=='image') map.setView(latlngHint, map.getZoom(), {animate:true});
         }
-        calibrateBearing(id); // per-image anchor
-      } finally {
-        if (navLock === myLock) navLock = 0;
-      }
+        calibrateBearing(id);
+      }finally{ if(navLock===myLock) navLock=0; }
     }
 
-    // ---------------- Init ----------------
+    // -------- Init --------
     (async function init(){
-      if (!TOKEN) { status("Add ?token=YOUR_TOKEN"); return; }
-
-      const M = window.Mapillary || window.mapillary || window.mapillaryjs;
-      const ViewerCtor = M && M.Viewer;
-      if (!ViewerCtor) { status("Mapillary library failed to load."); return; }
-
-      viewer = new ViewerCtor({ container:"mly", accessToken:TOKEN });
-      try { viewer.setFieldOfView(FOV_DEG); } catch {}
+      if(!TOKEN){ status("Add ?token=YOUR_TOKEN"); return; }
+      const M=window.Mapillary || window.mapillary || window.mapillaryjs;
+      const ViewerCtor=M && M.Viewer; if(!ViewerCtor){ status("Mapillary library failed to load."); return; }
+      viewer=new ViewerCtor({ container:"mly", accessToken:TOKEN });
+      try{ viewer.setFieldOfView(FOV_DEG); }catch{}
 
       status("Searching for a nearby image…");
-      const start = await findImageNear({ lat: defaults.lat, lng: defaults.lng });
-      if (!start) { status(`No imagery by "${defaults.username}" near start.`); return; }
+      const start=await findImageNear({lat:defaults.lat,lng:defaults.lng});
+      if(!start){ status(`No imagery by "${defaults.username}" near start.`); return; }
 
       await gotoImage(start.id);
       status("");
 
-      try {
-        viewer.on('image', (ev) => {
-          const id = ev?.image?.id || ev?.imageId || ev?.id;
-          if (id) calibrateBearing(id);
+      try{
+        viewer.on('image',(ev)=>{
+          const id=ev?.image?.id || ev?.imageId || ev?.id;
+          if(id) calibrateBearing(id);
         });
-      } catch {}
+      }catch{}
 
       startCompassWatcher();
-      if (SHOW_PINS) drawPinsForView();
+      if(SHOW_PINS) drawPinsForView();
     })();
   </script>
 </body>
