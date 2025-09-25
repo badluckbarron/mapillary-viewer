@@ -2,14 +2,14 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>MapillaryJS – image + map (live FOV with fallbacks)</title>
+  <title>MapillaryJS – image + map (pov-synced wedge)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.css" />
   <script src="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.min.js"></script>
 
-  <!-- Leaflet (OSM tiles) -->
+  <!-- Leaflet -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
@@ -53,10 +53,8 @@
 
     // FOV / wedge control
     const FOV_DEG_DEFAULT = Number(qs.get("fov") ?? 60);         // starting viewer FOV + fallback wedge
-    const WEDGE_MODE = (qs.get("wedgeMode") || "viewer").toLowerCase(); // viewer | zoom | fixed
-    const WEDGE_BASE = Number(qs.get("wedgeBase") ?? 60);        // used in zoom mode
     const DEBUG = qs.get("debug") === "1";
-    let currentFovDeg = FOV_DEG_DEFAULT;                         // live-synced wedge width
+    let currentFovDeg = FOV_DEG_DEFAULT;
     let lastYaw = null;
 
     const status = (t) => { document.getElementById('msg').textContent = t || ""; };
@@ -81,15 +79,10 @@
     const pinLayer = L.layerGroup().addTo(map);
     const orientationLayer = L.layerGroup().addTo(map); // wedge + center line
 
-    // Nice green pins
+    // Green pins
     const defaultPinStyle = {
-      radius: 4,
-      color: '#1b5e20',
-      weight: 2,
-      opacity: 1,
-      fillColor: '#2ecc71',
-      fillOpacity: 0.9,
-      className: 'pin'
+      radius: 4, color: '#1b5e20', weight: 2, opacity: 1,
+      fillColor: '#2ecc71', fillOpacity: 0.9, className: 'pin'
     };
 
     // --- Helpers ---
@@ -136,11 +129,11 @@
       return j?.data?.[0] ?? null;
     }
 
-    async function fetchImagesInBbox({bbox, cap=3000}) {
+    async function fetchImagesInBbox({bbox, cap=1500}) {
       let url = new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields", "id,computed_geometry");
       url.searchParams.set("bbox", bbox.join(","));
-      url.searchParams.set("limit", "300");
+      url.searchParams.set("limit", "100");
       if (defaults.username) url.searchParams.set("creator_username", defaults.username);
       const out = [];
       while (url && out.length < cap) {
@@ -195,75 +188,59 @@
 
     // Mapillary viewer
     let viewer = null;
-    let navLock = 0;
-    let yawTimer = null;
+    let navLock = 0;     // avoid races
 
-    // Read yaw + FOV/Zoom from the viewer; update currentFovDeg per WEDGE_MODE
-    async function readViewer() {
-      let yawDeg = null, fovDeg = null, zoom = null;
-
-      // Try modern APIs
+    // Update wedge immediately from viewer POV event
+    function bindPovListeners() {
+      // POV change (preferred – fires while you drag/zoom)
       try {
-        if (typeof viewer?.getState === 'function') {
-          const st = await viewer.getState();
-          let y = st?.pov?.yaw ?? st?.bearing ?? null;
-          let f = st?.pov?.fov ?? st?.fov ?? null;
-          let z = st?.zoom ?? null;
-          if (typeof y === 'number' && Math.abs(y) <= Math.PI * 2) y = y * 180/Math.PI;
-          if (typeof f === 'number' && f <= Math.PI * 2) f = f * 180/Math.PI;
-          yawDeg = (typeof y === 'number') ? ((y % 360)+360)%360 : null;
-          fovDeg = (typeof f === 'number') ? f : null;
-          zoom = (typeof z === 'number') ? z : null;
-        }
+        viewer.on('pov', (ev) => {
+          const yaw = ev?.pov?.yaw;
+          const fov = ev?.pov?.fov;
+          // Convert radians -> degrees if needed
+          let yawDeg = (typeof yaw === 'number' && Math.abs(yaw) <= Math.PI * 2) ? yaw * 180/Math.PI : yaw;
+          let fovDeg = (typeof fov === 'number' && fov <= Math.PI * 2) ? fov * 180/Math.PI : fov;
+          if (typeof fovDeg === 'number') currentFovDeg = Math.min(140, Math.max(10, fovDeg));
+          if (typeof yawDeg === 'number') {
+            yawDeg = ((yawDeg % 360) + 360) % 360;
+            const pos = marker.getLatLng();
+            drawOrientation(pos.lat, pos.lng, yawDeg, currentFovDeg, 50);
+            lastYaw = yawDeg;
+            dbg(`event=pov\nyaw=${yawDeg.toFixed(1)}°\nfov=${currentFovDeg.toFixed(1)}°`);
+          }
+        });
       } catch {}
 
-      // Try dedicated getters (some builds)
+      // FOV change (some builds emit this separately)
       try {
-        if (fovDeg == null && typeof viewer?.getFieldOfView === 'function') {
-          let f = viewer.getFieldOfView();
-          fovDeg = (typeof f === 'number' && f <= Math.PI * 2) ? (f * 180/Math.PI) : f;
-        }
-        if (zoom == null && typeof viewer?.getZoom === 'function') {
-          const z = viewer.getZoom();
-          zoom = (typeof z === 'number') ? z : null;
-        }
-        if (yawDeg == null && typeof viewer?.getPointOfView === 'function') {
-          const pov = viewer.getPointOfView();
-          let y = pov?.yaw, f = pov?.fov;
-          if (typeof y === 'number' && Math.abs(y) <= Math.PI * 2) y = y * 180/Math.PI;
+        viewer.on('fov', (ev) => {
+          let f = ev?.fov;
           if (typeof f === 'number' && f <= Math.PI * 2) f = f * 180/Math.PI;
-          yawDeg = (typeof y === 'number') ? ((y % 360)+360)%360 : yawDeg;
-          fovDeg = (fovDeg == null && typeof f === 'number') ? f : fovDeg;
-        }
+          if (typeof f === 'number') currentFovDeg = Math.min(140, Math.max(10, f));
+          dbg(`event=fov\nfov=${currentFovDeg.toFixed(1)}°`);
+        });
       } catch {}
-
-      // Decide wedge width
-      if (WEDGE_MODE === 'viewer' && typeof fovDeg === 'number') {
-        currentFovDeg = Math.min(140, Math.max(10, fovDeg));
-      } else if (WEDGE_MODE === 'zoom' && typeof zoom === 'number') {
-        // heuristic: smaller FOV at higher zoom
-        const z = Math.max(zoom, 1);
-        currentFovDeg = Math.min(140, Math.max(10, WEDGE_BASE / z));
-      } else if (WEDGE_MODE === 'fixed') {
-        currentFovDeg = FOV_DEG_DEFAULT;
-      } // else leave as-is
-
-      dbg(`mode=${WEDGE_MODE}\nyaw=${yawDeg?.toFixed?.(1) ?? '—'}°\nfov=${(currentFovDeg).toFixed(1)}°\nzoom=${zoom ?? '—'}`);
-
-      return { yawDeg };
     }
 
-    function startWatcher() {
-      if (yawTimer) clearInterval(yawTimer);
-      yawTimer = setInterval(async () => {
-        const { yawDeg } = await readViewer();
-        if (yawDeg == null) return;
-        if (lastYaw == null || Math.abs(((yawDeg - lastYaw + 540) % 360) - 180) > 1) {
-          lastYaw = yawDeg;
-          const pos = marker.getLatLng();
-          drawOrientation(pos.lat, pos.lng, yawDeg, currentFovDeg, 50);
+    // Fallback poller if events aren’t supported
+    async function pollViewerPovOnce() {
+      try {
+        if (viewer?.getState) {
+          const st = await viewer.getState();
+          let yaw = st?.pov?.yaw ?? st?.bearing ?? null;
+          let fov = st?.pov?.fov ?? st?.fov ?? null;
+          if (typeof yaw === 'number' && Math.abs(yaw) <= Math.PI * 2) yaw = yaw * 180/Math.PI;
+          if (typeof fov === 'number' && fov <= Math.PI * 2) fov = f * 180/Math.PI;
+          if (typeof fov === 'number') currentFovDeg = Math.min(140, Math.max(10, fov));
+          if (typeof yaw === 'number') {
+            const yawDeg = ((yaw % 360) + 360) % 360;
+            const pos = marker.getLatLng();
+            drawOrientation(pos.lat, pos.lng, yawDeg, currentFovDeg, 50);
+            lastYaw = yawDeg;
+            dbg(`poll\nyaw=${yawDeg.toFixed(1)}°\nfov=${currentFovDeg.toFixed(1)}°`);
+          }
         }
-      }, 150);
+      } catch {}
     }
 
     async function gotoImage(id, latlngHint) {
@@ -275,6 +252,8 @@
           marker.setLatLng([latlngHint[0], latlngHint[1]]);
           if (VIEW !== 'image') map.setView(latlngHint, map.getZoom(), { animate: true });
         }
+        // Kick a POV poll right after navigation (helps on builds without events)
+        setTimeout(pollViewerPovOnce, 50);
       } finally {
         if (navLock === myLock) navLock = 0;
       }
@@ -301,10 +280,10 @@
         await gotoImage(start.id);
         status("");
 
-        // Set initial viewer FOV (only meaningful if your build supports FOV)
+        // Initial viewer FOV
         try { viewer.setFieldOfView(FOV_DEG_DEFAULT); currentFovDeg = FOV_DEG_DEFAULT; } catch {}
 
-        // Fetch geometry + initial bearing to place wedge
+        // Image → map sync (position + initial bearing)
         async function syncMap(imageId) {
           try {
             const url = new URL(`https://graph.mapillary.com/${imageId}`);
@@ -318,30 +297,36 @@
               const latlng = [coords[1], coords[0]];
               marker.setLatLng(latlng);
               if (VIEW !== 'image') map.setView(latlng, map.getZoom(), { animate: true });
-              drawOrientation(latlng[0], latlng[1],
-                              typeof bearing === 'number' ? bearing : (lastYaw ?? 0),
-                              currentFovDeg, 50);
+              const yawDeg = (typeof bearing === 'number') ? bearing : (lastYaw ?? 0);
+              drawOrientation(latlng[0], latlng[1], yawDeg, currentFovDeg, 50);
+              lastYaw = yawDeg;
             }
           } catch {}
         }
 
         await syncMap(start.id);
 
+        // Listen for image changes
         try {
           viewer.on('image', (ev) => {
             if (navLock) return;
-            lastYaw = null;
             const id = ev?.image?.id || ev?.imageId || ev?.id;
-            if (id) syncMap(id);
+            if (id) { lastYaw = null; syncMap(id); setTimeout(pollViewerPovOnce, 50); }
           });
         } catch {
+          // Fallback polling of current image id if no event
           setInterval(async () => {
             if (navLock) return;
             try { const id = (await viewer.getState?.())?.imageId; if (id) { lastYaw = null; syncMap(id); } } catch {}
-          }, 1500);
+          }, 1200);
         }
 
-        startWatcher();
+        // Hook into POV/FOV events (if the build supports them)
+        bindPovListeners();
+
+        // As a safety net, poll POV at a slow cadence (covers builds without events)
+        setInterval(pollViewerPovOnce, 400);
+
         if (SHOW_PINS) drawPinsForView();
 
       } catch (e) {
