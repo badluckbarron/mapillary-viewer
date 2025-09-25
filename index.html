@@ -91,7 +91,7 @@
       let url = new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields", "id,computed_geometry");
       url.searchParams.set("bbox", bbox.join(","));
-      url.searchParams.set("limit", "100");
+      url.searchParams.set("limit", "500");
       if (defaults.username) url.searchParams.set("creator_username", defaults.username);
 
       const out = [];
@@ -118,7 +118,7 @@
           if (!coords) continue;
           const latlng = [coords[1], coords[0]];
           const c = L.circleMarker(latlng, {
-            radius: 3, weight: 1, opacity: 0.9, fillOpacity: 0.6, className: 'pin'
+            radius: 3, color: '#1b5e20', weight: 1, opacity: 0.9, fillColor: '#2ecc71', fillOpacity: 0.6, className: 'pin'
           });
 
           // Stop this click from bubbling to the map's click handler
