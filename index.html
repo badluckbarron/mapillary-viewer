@@ -4,37 +4,31 @@
   <meta charset="utf-8" />
   <title>MapillaryJS – start at lat/lng + user</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.css" />
   <style>
     html, body { height: 100%; margin: 0; }
     #mly { height: 100vh; width: 100%; }
     #msg { font: 14px/1.4 system-ui, sans-serif; padding: 1rem; }
   </style>
-  <!-- Non-module build from CDN -->
-  <script src="https://unpkg.com/mapillary-js@latest/dist/mapillary.min.js"></script>
+  <!-- UMD build (creates a global like Mapillary/mapillary) -->
+  <script src="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.min.js"></script>
 </head>
 <body>
   <div id="mly" aria-label="Mapillary viewer"></div>
   <div id="msg"></div>
 
   <script>
+    const status = (t) => { document.getElementById('msg').textContent = t || ""; };
+
     // ---- Read params from URL ----
     const qs = new URLSearchParams(location.search);
-    const TOKEN = qs.get("token") || ""; // pass ?token=... in URL
+    const TOKEN = qs.get("token") || "";
     const defaults = {
       lat: Number(qs.get("lat") ?? 30.145619851543174),
       lng: Number(qs.get("lng") ?? -91.87748325231672),
       z:   Number(qs.get("z")   ?? 11.4),
       username: qs.get("username") ?? "HKocen"
     };
-
-    // Basic status helper
-    const status = (t) => { document.getElementById('msg').textContent = t || ""; };
-
-    if (!TOKEN) {
-      status("Add your Mapillary token to the URL, e.g. ?token=YOUR_TOKEN");
-    }
-
-    // Rough map zoom -> search radius (meters) for API query
     const zoomToMeters = (z) => 500000 / Math.pow(2, z);
 
     async function findImageNear({lat, lng, radiusMeters, username, token}) {
@@ -44,7 +38,6 @@
       url.searchParams.set("radius", Math.max(25, Math.round(radiusMeters)));
       url.searchParams.set("limit", "1");
       url.searchParams.set("creator_username", username);
-
       const res = await fetch(url, { headers: { Authorization: `OAuth ${token}` }});
       if (!res.ok) throw new Error(`API error ${res.status}`);
       const data = await res.json();
@@ -53,13 +46,26 @@
 
     (async function init(){
       try {
-        if (!TOKEN) return;
+        if (!TOKEN) { status("Add your Mapillary token to the URL, e.g. ?token=YOUR_TOKEN"); return; }
 
-        // Create viewer (global object from CDN is Mapillary)
-        const viewer = new Mapillary.Viewer({
-          container: "mly",
-          accessToken: TOKEN
-        });
+        // Grab whichever global the library exposed
+        const M = window.Mapillary || window.mapillary || window.mapillaryjs;
+        let ViewerCtor = M && M.Viewer;
+
+        // Fallback: try dynamic ESM import if no global found
+        if (!ViewerCtor) {
+          const candidates = [
+            "https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.module.js",
+            "https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.esm.js"
+          ];
+          for (const u of candidates) {
+            try { ViewerCtor = (await import(u)).Viewer; break; } catch (e) {}
+          }
+        }
+
+        if (!ViewerCtor) { status("Mapillary library failed to load (network/CSP)."); return; }
+
+        const viewer = new ViewerCtor({ container: "mly", accessToken: TOKEN });
 
         status("Searching for a nearby image…");
         const start = await findImageNear({
@@ -70,23 +76,16 @@
           token: TOKEN
         });
 
-        if (!start) {
-          status(`No imagery by "${defaults.username}" near ${defaults.lat.toFixed(5)}, ${defaults.lng.toFixed(5)}.`);
-          return;
-        }
+        if (!start) { status(`No imagery by "${defaults.username}" near ${defaults.lat.toFixed(5)}, ${defaults.lng.toFixed(5)}.`); return; }
 
-        status(""); // clear message
+        status(""); // clear
         await viewer.moveTo(start.id);
 
-        // Keep navigation on that user's imagery; fall back to sequence if property not available
-        try {
-          await viewer.setFilter(["==", "creatorUsername", defaults.username]);
-        } catch {
-          await viewer.setFilter(["in", "sequenceId", start.sequence_id]);
-        }
+        // Keep navigation on that user's imagery; fall back to sequence
+        try { await viewer.setFilter(["==", "creatorUsername", defaults.username]); }
+        catch { await viewer.setFilter(["in", "sequenceId", start.sequence_id]); }
 
-        // Optional: initial FOV (“zoom”). Smaller = more zoom-in.
-        viewer.setFieldOfView(45);
+        viewer.setFieldOfView(45); // optional "zoom" (smaller = more zoom)
       } catch (e) {
         console.error(e);
         status("Error: " + (e?.message || e));
