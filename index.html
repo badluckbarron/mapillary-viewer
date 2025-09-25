@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>MapillaryJS – image + map (live orientation)</title>
+  <title>MapillaryJS – image + map (live orientation + pins)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -46,8 +46,8 @@
     };
     const VIEW = (qs.get("view") || "image").toLowerCase();      // image | map | split
     const SHOW_PINS = (qs.get("pins") || "").toLowerCase() === "all";
-    const FOV_DEG_DEFAULT = Number(qs.get("fov") ?? 60); // default wedge & viewer FOV
-    let currentFovDeg = FOV_DEG_DEFAULT;
+    const FOV_DEG_DEFAULT = Number(qs.get("fov") ?? 60);         // initial viewer FOV & wedge width
+    let currentFovDeg = FOV_DEG_DEFAULT;                          // <-- live-synced FOV for wedge
 
     const status = (t) => { document.getElementById('msg').textContent = t || ""; };
 
@@ -55,7 +55,9 @@
     const wrap = document.getElementById('wrap');
     wrap.className = VIEW === 'split' ? 'split' : (VIEW === 'map' ? 'map-only' : 'image-only');
 
-    // Map
+    function zoomToMeters(z) { return 500000 / Math.pow(2, z); }
+
+    // --- Leaflet map ---
     const map = L.map('map', { zoomControl: true, attributionControl: true });
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
@@ -79,13 +81,12 @@
       className: 'pin'
     };
 
-    // Helpers
+    // --- Helpers ---
     function bboxFromMap(m) {
       const b = m.getBounds();
       const sw = b.getSouthWest(), ne = b.getNorthEast();
       return [sw.lng, sw.lat, ne.lng, ne.lat]; // minLon,minLat,maxLon,maxLat
     }
-    function zoomToMeters(z) { return 500000 / Math.pow(2, z); }
 
     // Geodesic destination from (lat,lng) given bearing (deg) and distance (m)
     function destPoint(lat, lng, bearingDeg, meters) {
@@ -98,8 +99,8 @@
       return [φ2 * 180 / Math.PI, ((λ2 * 180 / Math.PI + 540) % 360) - 180];
     }
 
-    // Draw a wedge + center line from (lat,lng) toward bearingDeg
-    function drawOrientation(lat, lng, bearingDeg, fovDeg, length = 50) {
+    // Draw a wedge + center line from (lat,lng) toward bearingDeg with fovDeg width
+    function drawOrientation(lat, lng, bearingDeg, fovDeg = currentFovDeg, length = 50) {
       orientationLayer.clearLayers();
       if (typeof bearingDeg !== 'number') return;
       const left = bearingDeg - fovDeg / 2;
@@ -117,7 +118,7 @@
       const url = new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields", "id,computed_geometry");
       url.searchParams.set("closeto", `${lng},${lat}`);
-      url.searchParams.set("radius", Math.max(25, Math.round(zoomToMeters(12))));
+      url.searchParams.set("radius", Math.max(25, Math.round(zoomToMeters(defaults.z))));
       url.searchParams.set("limit", "1");
       if (defaults.username) url.searchParams.set("creator_username", defaults.username);
       const res = await fetch(url, { headers: { Authorization: `OAuth ${TOKEN}` }});
@@ -163,9 +164,7 @@
           c.addTo(pinLayer);
         }
         status(images.length ? `Pins: ${images.length}` : "No images in view for this user.");
-      } catch (e) {
-        console.error(e); status("Error loading pins.");
-      }
+      } catch (e) { console.error(e); status("Error loading pins."); }
     }
 
     // Debounce pin requery
@@ -189,59 +188,57 @@
 
     // Mapillary viewer
     let viewer = null;
-    let navLock = 0;         // prevents click races
-    let yawTimer = null;     // live yaw watcher
+    let navLock = 0;     // prevents click races
+    let yawTimer = null; // live yaw watcher
     let lastYaw = null;
 
-    // Try to read yaw/FOV from the viewer (supports multiple MJS builds)
+    // Read yaw + FOV from the viewer (supports multiple MJS builds) and update currentFovDeg
     async function readViewerYawFov() {
-  try {
-    // Try explicit getters first
-    if (typeof viewer?.getFieldOfView === 'function' || typeof viewer?.getState === 'function' || typeof viewer?.getPointOfView === 'function') {
-      // FOV
-      let fovDeg = null;
-      if (typeof viewer.getFieldOfView === 'function') {
-        let f = viewer.getFieldOfView();                 // may be deg or rad
-        fovDeg = (typeof f === 'number' && f <= Math.PI * 2) ? (f * 180 / Math.PI) : f;
-      }
-      // State/POV (for yaw and backup FOV)
-      let yawDeg = null;
-      if (typeof viewer.getState === 'function') {
-        const st = await viewer.getState();
-        let y = st?.pov?.yaw ?? st?.bearing ?? null;
-        let f = st?.pov?.fov ?? st?.fov ?? null;
-        if (typeof y === 'number' && Math.abs(y) <= Math.PI * 2) y = y * 180 / Math.PI;
-        if (typeof f === 'number' && f <= Math.PI * 2) f = f * 180 / Math.PI;
-        if (y != null) yawDeg = ((y % 360) + 360) % 360;
-        if (fovDeg == null && f != null) fovDeg = f;
-      } else if (typeof viewer.getPointOfView === 'function') {
-        const pov = viewer.getPointOfView();
-        let y = pov?.yaw, f = pov?.fov;
-        if (typeof y === 'number' && Math.abs(y) <= Math.PI * 2) y = y * 180 / Math.PI;
-        if (typeof f === 'number' && f <= Math.PI * 2) f = f * 180 / Math.PI;
-        if (y != null) yawDeg = ((y % 360) + 360) % 360;
-        if (fovDeg == null && f != null) fovDeg = f;
-      }
+      try {
+        // Prefer dedicated getter if present
+        let fovDeg = null;
+        if (typeof viewer?.getFieldOfView === 'function') {
+          let f = viewer.getFieldOfView(); // may be deg or rad
+          fovDeg = (typeof f === 'number' && f <= Math.PI * 2) ? (f * 180 / Math.PI) : f;
+        }
 
-      // Clamp to reasonable range
-      if (typeof fovDeg === 'number') fovDeg = Math.min(140, Math.max(10, fovDeg));
-      return { yawDeg, fovDeg };
+        let yawDeg = null;
+        if (typeof viewer?.getState === 'function') {
+          const st = await viewer.getState();
+          let y = st?.pov?.yaw ?? st?.bearing ?? null;
+          let f = st?.pov?.fov ?? st?.fov ?? null;
+          if (typeof y === 'number' && Math.abs(y) <= Math.PI * 2) y = y * 180 / Math.PI;
+          if (typeof f === 'number' && f <= Math.PI * 2) f = f * 180 / Math.PI;
+          if (y != null) yawDeg = ((y % 360) + 360) % 360;
+          if (fovDeg == null && f != null) fovDeg = f;
+        } else if (typeof viewer?.getPointOfView === 'function') {
+          const pov = viewer.getPointOfView();
+          let y = pov?.yaw, f = pov?.fov;
+          if (typeof y === 'number' && Math.abs(y) <= Math.PI * 2) y = y * 180 / Math.PI;
+          if (typeof f === 'number' && f <= Math.PI * 2) f = f * 180 / Math.PI;
+          if (y != null) yawDeg = ((y % 360) + 360) % 360;
+          if (fovDeg == null && f != null) fovDeg = f;
+        }
+
+        if (typeof fovDeg === 'number') {
+          fovDeg = Math.min(140, Math.max(10, fovDeg)); // clamp
+          currentFovDeg = fovDeg;                       // <-- keep live FOV
+        }
+        return { yawDeg, fovDeg: currentFovDeg };
+      } catch {}
+      return { yawDeg: null, fovDeg: currentFovDeg };
     }
-  } catch {}
-  return { yawDeg: null, fovDeg: null };
-}
-
 
     function startYawWatcher() {
       if (yawTimer) clearInterval(yawTimer);
       yawTimer = setInterval(async () => {
-        const { yawDeg, fovDeg } = await readViewerYawFov();
+        const { yawDeg } = await readViewerYawFov(); // updates currentFovDeg internally
         if (yawDeg == null) return;
         // Only redraw if yaw changed ~1°
         if (lastYaw == null || Math.abs(((yawDeg - lastYaw + 540) % 360) - 180) > 1) {
           lastYaw = yawDeg;
           const pos = marker.getLatLng();
-          drawOrientation(pos.lat, pos.lng, yawDeg, fovDeg ?? FOV_DEG_DEFAULT, 50);
+          drawOrientation(pos.lat, pos.lng, yawDeg, currentFovDeg, 50); // <-- live FOV
         }
       }, 150);
     }
@@ -282,10 +279,10 @@
         await gotoImage(start.id);
         status("");
 
-        // Set viewer FOV (also used for wedge width if viewer doesn't expose FOV)
-        try { viewer.setFieldOfView(FOV_DEG_DEFAULT); } catch {}
+        // Set initial viewer FOV; live watcher will keep currentFovDeg synced
+        try { viewer.setFieldOfView(FOV_DEG_DEFAULT); currentFovDeg = FOV_DEG_DEFAULT; } catch {}
 
-        // Sync map + orientation when the image changes
+        // Sync map + (initial) orientation when the image changes
         async function syncMap(imageId) {
           try {
             const url = new URL(`https://graph.mapillary.com/${imageId}`);
@@ -299,8 +296,10 @@
               const latlng = [coords[1], coords[0]];
               marker.setLatLng(latlng);
               if (VIEW !== 'image') map.setView(latlng, map.getZoom(), { animate: true });
-              // Draw once from API bearing; live watcher will take over as user pans
-              drawOrientation(latlng[0], latlng[1], typeof bearing === 'number' ? bearing : lastYaw ?? 0, FOV_DEG_DEFAULT, 50);
+              // Draw once from API bearing; yaw watcher will take over as user pans/zooms
+              drawOrientation(latlng[0], latlng[1],
+                              typeof bearing === 'number' ? bearing : (lastYaw ?? 0),
+                              currentFovDeg, 50);
             }
           } catch {}
         }
@@ -310,17 +309,19 @@
         try {
           viewer.on('image', (ev) => {
             if (navLock) return;
+            lastYaw = null; // force next redraw
             const id = ev?.image?.id || ev?.imageId || ev?.id;
-            if (id) { lastYaw = null; syncMap(id); }
+            if (id) syncMap(id);
           });
         } catch {
+          // Fallback polling if event not available
           setInterval(async () => {
             if (navLock) return;
             try { const id = (await viewer.getState?.())?.imageId; if (id) { lastYaw = null; syncMap(id); } } catch {}
           }, 1500);
         }
 
-        // Start live yaw watcher (updates wedge while you pan/drag in the viewer)
+        // Start live yaw/FOV watcher (updates wedge while you pan/zoom in the viewer)
         startYawWatcher();
 
         if (SHOW_PINS) drawPinsForView();
