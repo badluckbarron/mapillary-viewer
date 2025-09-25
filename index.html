@@ -2,90 +2,171 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>MapillaryJS – start at lat/lng + user</title>
+  <title>MapillaryJS – image + map (split or toggle)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- MapillaryJS -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.css" />
+  <script src="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.min.js"></script>
+
+  <!-- Leaflet (OSM tiles) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
   <style>
     html, body { height: 100%; margin: 0; }
-    #mly { height: 100vh; width: 100%; }
-    #msg { font: 14px/1.4 system-ui, sans-serif; padding: 1rem; }
+    #wrap { height: 100vh; width: 100%; }
+    #mly, #map { height: 100%; width: 100%; }
+    #msg { position: absolute; top: 8px; left: 8px; z-index: 1000;
+           background: rgba(0,0,0,0.6); color: #fff; padding: 6px 10px; border-radius: 6px;
+           font: 13px/1.4 system-ui, sans-serif; }
+    /* Layouts */
+    .image-only { display: block; position: relative; }
+    .image-only #map { display: none; }
+    .map-only   { display: block; }
+    .map-only   #mly { display: none; }
+    .split      { display: grid; grid-template-columns: 1fr 1fr; }
+    .split #mly, .split #map { display: block; }
   </style>
-  <!-- UMD build (creates a global like Mapillary/mapillary) -->
-  <script src="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.min.js"></script>
 </head>
 <body>
-  <div id="mly" aria-label="Mapillary viewer"></div>
-  <div id="msg"></div>
+  <div id="wrap" class="image-only">
+    <div id="mly" aria-label="Mapillary viewer"></div>
+    <div id="map" aria-label="Map"></div>
+    <div id="msg"></div>
+  </div>
 
   <script>
-    const status = (t) => { document.getElementById('msg').textContent = t || ""; };
-
-    // ---- Read params from URL ----
     const qs = new URLSearchParams(location.search);
-    const TOKEN = qs.get("token") || "";
+    const TOKEN = qs.get("token") || ""; // Mapillary token via ?token=...
     const defaults = {
       lat: Number(qs.get("lat") ?? 30.145619851543174),
       lng: Number(qs.get("lng") ?? -91.87748325231672),
       z:   Number(qs.get("z")   ?? 11.4),
-      username: qs.get("username") ?? "HKocen"
+      username: (qs.get("username") || "HKocen").trim()
     };
+    const VIEW = (qs.get("view") || "image").toLowerCase(); // image | map | split
+    const status = (t) => { document.getElementById('msg').textContent = t || ""; };
+
+    // Set layout
+    const wrap = document.getElementById('wrap');
+    wrap.className = VIEW === 'split' ? 'split' : (VIEW === 'map' ? 'map-only' : 'image-only');
+
+    // Rough map zoom -> search radius (meters)
     const zoomToMeters = (z) => 500000 / Math.pow(2, z);
 
-    async function findImageNear({lat, lng, radiusMeters, username, token}) {
+    // --- Leaflet map (always available; doesn’t need token) ---
+    const map = L.map('map', { zoomControl: true, attributionControl: true });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const startLatLng = [defaults.lat, defaults.lng];
+    map.setView(startLatLng, 13);
+
+    let marker = L.marker(startLatLng, { draggable: false }).addTo(map);
+
+    // --- Mapillary helper: find nearest image for user near lat/lng ---
+    async function findImageNear({lat, lng}) {
       const url = new URL("https://graph.mapillary.com/images");
-      url.searchParams.set("fields", "id,sequence_id,computed_geometry,creator{username}");
+      url.searchParams.set("fields", "id,sequence_id,computed_geometry");
       url.searchParams.set("closeto", `${lng},${lat}`);
-      url.searchParams.set("radius", Math.max(25, Math.round(radiusMeters)));
+      url.searchParams.set("radius", Math.max(25, Math.round(zoomToMeters(defaults.z))));
       url.searchParams.set("limit", "1");
-      url.searchParams.set("creator_username", username);
-      const res = await fetch(url, { headers: { Authorization: `OAuth ${token}` }});
+      if (defaults.username) url.searchParams.set("creator_username", defaults.username);
+
+      const res = await fetch(url, { headers: { Authorization: `OAuth ${TOKEN}` }});
       if (!res.ok) throw new Error(`API error ${res.status}`);
       const data = await res.json();
       return data?.data?.[0] ?? null;
     }
 
-    (async function init(){
+    // --- Map click: jump viewer to nearest image for that user ---
+    map.on('click', async (e) => {
+      if (!TOKEN) { status("Add ?token=... to enable image navigation."); return; }
       try {
-        if (!TOKEN) { status("Add your Mapillary token to the URL, e.g. ?token=YOUR_TOKEN"); return; }
-
-        // Grab whichever global the library exposed
-        const M = window.Mapillary || window.mapillary || window.mapillaryjs;
-        let ViewerCtor = M && M.Viewer;
-
-        // Fallback: try dynamic ESM import if no global found
-        if (!ViewerCtor) {
-          const candidates = [
-            "https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.module.js",
-            "https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.esm.js"
-          ];
-          for (const u of candidates) {
-            try { ViewerCtor = (await import(u)).Viewer; break; } catch (e) {}
-          }
+        status("Finding image near map click…");
+        const img = await findImageNear({ lat: e.latlng.lat, lng: e.latlng.lng });
+        if (img) {
+          await viewer.moveTo(img.id);
+          status("");
+        } else {
+          status("No image found near that point for this user.");
         }
+      } catch (err) {
+        console.error(err);
+        status("Error searching for image near click.");
+      }
+    });
 
-        if (!ViewerCtor) { status("Mapillary library failed to load (network/CSP)."); return; }
+    // --- Mapillary viewer (only if token present) ---
+    let viewer = null;
+    (async function init(){
+      if (!TOKEN) {
+        status("Map only: add ?view=split (or image) and ?token=YOUR_TOKEN to enable the viewer.");
+        // still show the map centered where requested
+        return;
+      }
 
-        const viewer = new ViewerCtor({ container: "mly", accessToken: TOKEN });
+      // Create viewer
+      const M = window.Mapillary || window.mapillary || window.mapillaryjs;
+      const ViewerCtor = M && M.Viewer;
+      if (!ViewerCtor) { status("Mapillary library failed to load."); return; }
 
+      viewer = new ViewerCtor({ container: "mly", accessToken: TOKEN });
+
+      try {
         status("Searching for a nearby image…");
-        const start = await findImageNear({
-          lat: defaults.lat,
-          lng: defaults.lng,
-          radiusMeters: zoomToMeters(defaults.z),
-          username: defaults.username,
-          token: TOKEN
-        });
-
+        const start = await findImageNear({ lat: defaults.lat, lng: defaults.lng });
         if (!start) { status(`No imagery by "${defaults.username}" near ${defaults.lat.toFixed(5)}, ${defaults.lng.toFixed(5)}.`); return; }
 
-        status(""); // clear
         await viewer.moveTo(start.id);
+        status("");
 
-        // Keep navigation on that user's imagery; fall back to sequence
+        // Keep navigation to that user's imagery (fallback to starting sequence)
         try { await viewer.setFilter(["==", "creatorUsername", defaults.username]); }
         catch { await viewer.setFilter(["in", "sequenceId", start.sequence_id]); }
 
-        viewer.setFieldOfView(45); // optional "zoom" (smaller = more zoom)
+        viewer.setFieldOfView(45); // optional “zoom”
+
+        // --- Sync map when the current image changes ---
+        const updateMapToCurrent = async (imageId) => {
+          try {
+            const url = new URL(`https://graph.mapillary.com/${imageId}`);
+            url.searchParams.set("fields", "computed_geometry");
+            const res = await fetch(url, { headers: { Authorization: `OAuth ${TOKEN}` }});
+            if (!res.ok) return;
+            const j = await res.json();
+            const coords = j?.computed_geometry?.coordinates; // [lon, lat]
+            if (coords && coords.length === 2) {
+              const latlng = [coords[1], coords[0]];
+              marker.setLatLng(latlng);
+              if (VIEW !== 'image') map.setView(latlng, map.getZoom(), { animate: true });
+            }
+          } catch {}
+        };
+
+        // Fire once for starting image
+        await updateMapToCurrent(start.id);
+
+        // Listen for subsequent image changes
+        try {
+          viewer.on('image', (ev) => {
+            const id = ev?.image?.id || ev?.imageId || ev?.id;
+            if (id) updateMapToCurrent(id);
+          });
+        } catch {
+          // If event name differs in your MJS version, poll as a fallback:
+          setInterval(async () => {
+            try {
+              const state = await viewer.getState?.();
+              const id = state?.imageId;
+              if (id) updateMapToCurrent(id);
+            } catch {}
+          }, 1500);
+        }
+
       } catch (e) {
         console.error(e);
         status("Error: " + (e?.message || e));
