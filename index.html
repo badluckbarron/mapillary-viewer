@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>MapillaryJS – image + map (pov-synced wedge)</title>
+  <title>MapillaryJS – map wedge from viewer compass</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -21,7 +21,7 @@
            background: rgba(0,0,0,0.6); color: #fff; padding: 6px 10px; border-radius: 6px;
            font: 13px/1.4 system-ui, sans-serif; }
     #dbg { position: absolute; top: 8px; right: 8px; z-index: 1000;
-           background: rgba(20,20,20,0.7); color: #9ef; padding: 6px 10px; border-radius: 6px;
+           background: rgba(20,20,20,0.72); color: #9ef; padding: 6px 10px; border-radius: 6px;
            font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; display:none; }
     .image-only { display: block; position: relative; }
     .image-only #map { display: none; }
@@ -48,38 +48,31 @@
       z:   Number(qs.get("z")   ?? 12),
       username: (qs.get("username") || "HKocen").trim()
     };
-    const VIEW = (qs.get("view") || "image").toLowerCase();      // image | map | split
+    const VIEW = (qs.get("view") || "image").toLowerCase();   // image | map | split
     const SHOW_PINS = (qs.get("pins") || "").toLowerCase() === "all";
-
-    // FOV / wedge control
-    const FOV_DEG_DEFAULT = Number(qs.get("fov") ?? 60);         // starting viewer FOV + fallback wedge
+    const FOV_DEG_DEFAULT = Number(qs.get("fov") ?? 60);      // wedge width & viewer start FOV
     const DEBUG = qs.get("debug") === "1";
-    let currentFovDeg = FOV_DEG_DEFAULT;
-    let lastYaw = null;
 
     const status = (t) => { document.getElementById('msg').textContent = t || ""; };
-    const dbg = (t) => { const el = document.getElementById('dbg'); if (DEBUG) { el.style.display='block'; el.textContent = t; } };
+    const dbg    = (t) => { const el = document.getElementById('dbg'); if (DEBUG) { el.style.display='block'; el.textContent = t; } };
 
     // Layout
     const wrap = document.getElementById('wrap');
     wrap.className = VIEW === 'split' ? 'split' : (VIEW === 'map' ? 'map-only' : 'image-only');
 
-    function zoomToMeters(z) { return 500000 / Math.pow(2, z); }
-
-    // --- Leaflet map ---
+    // Map
     const map = L.map('map', { zoomControl: true, attributionControl: true });
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '&copy; OpenStreetMap contributors'
+      maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
     const startLatLng = [defaults.lat, defaults.lng];
     map.setView(startLatLng, 13);
 
     const marker = L.marker(startLatLng, { draggable: false }).addTo(map);
     const pinLayer = L.layerGroup().addTo(map);
-    const orientationLayer = L.layerGroup().addTo(map); // wedge + center line
+    const orientationLayer = L.layerGroup().addTo(map);
 
-    // Green pins
+    // Pins (green)
     const defaultPinStyle = {
       radius: 4, color: '#1b5e20', weight: 2, opacity: 1,
       fillColor: '#2ecc71', fillOpacity: 0.9, className: 'pin'
@@ -87,22 +80,21 @@
 
     // --- Helpers ---
     function bboxFromMap(m) {
-      const b = m.getBounds();
-      const sw = b.getSouthWest(), ne = b.getNorthEast();
-      return [sw.lng, sw.lat, ne.lng, ne.lat]; // minLon,minLat,maxLon,maxLat
+      const b = m.getBounds(), sw = b.getSouthWest(), ne = b.getNorthEast();
+      return [sw.lng, sw.lat, ne.lng, ne.lat];
     }
+    function zoomToMeters(z) { return 500000 / Math.pow(2, z); }
 
+    // Destination point from (lat,lng) with bearing & distance (meters)
     function destPoint(lat, lng, bearingDeg, meters) {
-      const R = 6371000;
-      const br = bearingDeg * Math.PI / 180;
+      const R = 6371000, br = bearingDeg * Math.PI / 180;
       const φ1 = lat * Math.PI / 180, λ1 = lng * Math.PI / 180, δ = meters / R;
       const φ2 = Math.asin(Math.sin(φ1) * Math.cos(δ) + Math.cos(φ1) * Math.sin(δ) * Math.cos(br));
-      const λ2 = λ1 + Math.atan2(Math.sin(br) * Math.sin(δ) * Math.cos(φ1),
-                                  Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2));
+      const λ2 = λ1 + Math.atan2(Math.sin(br) * Math.sin(δ) * Math.cos(φ1), Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2));
       return [φ2 * 180 / Math.PI, ((λ2 * 180 / Math.PI + 540) % 360) - 180];
     }
 
-    function drawOrientation(lat, lng, bearingDeg, fovDeg = currentFovDeg, length = 50) {
+    function drawOrientation(lat, lng, bearingDeg, fovDeg = FOV_DEG_DEFAULT, length = 50) {
       orientationLayer.clearLayers();
       if (typeof bearingDeg !== 'number') return;
       const left = bearingDeg - fovDeg / 2;
@@ -110,35 +102,33 @@
       const tip   = destPoint(lat, lng, bearingDeg, length);
       const pLeft = destPoint(lat, lng, left,    length);
       const pRight= destPoint(lat, lng, right,   length);
-      L.polygon([[lat, lng], pLeft, pRight], {
-        color: '#1976d2', weight: 1, fillColor: '#1976d2', fillOpacity: 0.18
-      }).addTo(orientationLayer);
-      L.polyline([[lat, lng], tip], { color: '#1976d2', weight: 2, opacity: 0.9 }).addTo(orientationLayer);
+      L.polygon([[lat, lng], pLeft, pRight], { color:'#1976d2', weight:1, fillColor:'#1976d2', fillOpacity:0.18 }).addTo(orientationLayer);
+      L.polyline([[lat, lng], tip], { color:'#1976d2', weight:2, opacity:0.9 }).addTo(orientationLayer);
     }
 
+    // Mapillary API helpers
     async function findImageNear({lat, lng}) {
       const url = new URL("https://graph.mapillary.com/images");
-      url.searchParams.set("fields", "id,computed_geometry");
+      url.searchParams.set("fields","id,computed_geometry");
       url.searchParams.set("closeto", `${lng},${lat}`);
       url.searchParams.set("radius", Math.max(25, Math.round(zoomToMeters(defaults.z))));
-      url.searchParams.set("limit", "1");
+      url.searchParams.set("limit","1");
       if (defaults.username) url.searchParams.set("creator_username", defaults.username);
-      const res = await fetch(url, { headers: { Authorization: `OAuth ${TOKEN}` }});
-      if (!res.ok) throw new Error(`API error ${res.status}`);
+      const res = await fetch(url, { headers:{ Authorization:`OAuth ${TOKEN}` }});
+      if (!res.ok) throw new Error(`API ${res.status}`);
       const j = await res.json();
       return j?.data?.[0] ?? null;
     }
-
     async function fetchImagesInBbox({bbox, cap=1500}) {
       let url = new URL("https://graph.mapillary.com/images");
-      url.searchParams.set("fields", "id,computed_geometry");
+      url.searchParams.set("fields","id,computed_geometry");
       url.searchParams.set("bbox", bbox.join(","));
-      url.searchParams.set("limit", "100");
+      url.searchParams.set("limit","100");
       if (defaults.username) url.searchParams.set("creator_username", defaults.username);
       const out = [];
       while (url && out.length < cap) {
-        const res = await fetch(url, { headers: { Authorization: `OAuth ${TOKEN}` }});
-        if (!res.ok) throw new Error(`API error ${res.status}`);
+        const res = await fetch(url, { headers:{ Authorization:`OAuth ${TOKEN}` }});
+        if (!res.ok) throw new Error(`API ${res.status}`);
         const j = await res.json();
         if (Array.isArray(j.data)) out.push(...j.data);
         const next = j?.paging?.next;
@@ -155,184 +145,167 @@
         const images = await fetchImagesInBbox({ bbox: bboxFromMap(map) });
         pinLayer.clearLayers();
         for (const img of images) {
-          const coords = img?.computed_geometry?.coordinates; // [lon, lat]
-          if (!coords) continue;
-          const latlng = [coords[1], coords[0]];
-          const c = L.circleMarker(latlng, defaultPinStyle);
-          c.on('click', (e) => {
-            L.DomEvent.stop(e);
-            if (viewer) gotoImage(img.id, latlng);
-          });
-          c.addTo(pinLayer);
+          const c = img?.computed_geometry?.coordinates;
+          if (!c) continue;
+          const latlng = [c[1], c[0]];
+          const m = L.circleMarker(latlng, defaultPinStyle);
+          m.on('click', (e) => { L.DomEvent.stop(e); if (viewer) gotoImage(img.id, latlng); });
+          m.addTo(pinLayer);
         }
         status(images.length ? `Pins: ${images.length}` : "No images in view for this user.");
       } catch (e) { console.error(e); status("Error loading pins."); }
     }
 
-    let pinTimer = null;
-    map.on('moveend', () => {
-      if (!SHOW_PINS) return;
-      clearTimeout(pinTimer);
-      pinTimer = setTimeout(drawPinsForView, 350);
-    });
-
+    map.on('moveend', () => { if (SHOW_PINS) { clearTimeout(window._pt); window._pt = setTimeout(drawPinsForView, 300); } });
     map.on('click', async (e) => {
-      if (!TOKEN) { status("Add ?token=... to enable image navigation."); return; }
+      if (!TOKEN) { status("Add ?token=..."); return; }
       try {
-        status("Finding image near map click…");
+        status("Finding image near click…");
         const img = await findImageNear({ lat: e.latlng.lat, lng: e.latlng.lng });
         if (img) { await gotoImage(img.id, [e.latlng.lat, e.latlng.lng]); status(""); }
-        else { status("No image found near that point for this user."); }
-      } catch (err) { console.error(err); status("Error searching for image near click."); }
+        else status("No image found there.");
+      } catch (err) { console.error(err); status("Error searching."); }
     });
 
-    // Mapillary viewer
-    let viewer = null;
-    let navLock = 0;     // avoid races
+    // -------- Compass reader (DOM-based) --------
+    let viewer, navLock = 0;
+    let compassEl = null, compassOffset = null; // offset so compass rotation -> camera bearing
 
-    // Update wedge immediately from viewer POV event
-    function bindPovListeners() {
-      // POV change (preferred – fires while you drag/zoom)
-      try {
-        viewer.on('pov', (ev) => {
-          const yaw = ev?.pov?.yaw;
-          const fov = ev?.pov?.fov;
-          // Convert radians -> degrees if needed
-          let yawDeg = (typeof yaw === 'number' && Math.abs(yaw) <= Math.PI * 2) ? yaw * 180/Math.PI : yaw;
-          let fovDeg = (typeof fov === 'number' && fov <= Math.PI * 2) ? fov * 180/Math.PI : fov;
-          if (typeof fovDeg === 'number') currentFovDeg = Math.min(140, Math.max(10, fovDeg));
-          if (typeof yawDeg === 'number') {
-            yawDeg = ((yawDeg % 360) + 360) % 360;
-            const pos = marker.getLatLng();
-            drawOrientation(pos.lat, pos.lng, yawDeg, currentFovDeg, 50);
-            lastYaw = yawDeg;
-            dbg(`event=pov\nyaw=${yawDeg.toFixed(1)}°\nfov=${currentFovDeg.toFixed(1)}°`);
-          }
-        });
-      } catch {}
-
-      // FOV change (some builds emit this separately)
-      try {
-        viewer.on('fov', (ev) => {
-          let f = ev?.fov;
-          if (typeof f === 'number' && f <= Math.PI * 2) f = f * 180/Math.PI;
-          if (typeof f === 'number') currentFovDeg = Math.min(140, Math.max(10, f));
-          dbg(`event=fov\nfov=${currentFovDeg.toFixed(1)}°`);
-        });
-      } catch {}
+    // Find the compass element inside Mapillary Viewer
+    function findCompassEl() {
+      const host = document.getElementById('mly');
+      if (!host) return null;
+      // Heuristic: any element whose class/title/aria mentions "compass"
+      const nodes = host.querySelectorAll('*');
+      for (const el of nodes) {
+        const s = (el.className?.toString()||'') + ' ' + (el.getAttribute('aria-label')||'') + ' ' + (el.getAttribute('title')||'');
+        if (/compass/i.test(s)) return el;
+      }
+      return null;
     }
 
-    // Fallback poller if events aren’t supported
-    async function pollViewerPovOnce() {
+    // Parse CSS transform -> rotation degrees (0..360)
+    function getRotationDeg(el) {
+      if (!el) return null;
+      const styles = [el, el.firstElementChild].map(n => n ? getComputedStyle(n).transform : 'none');
+      for (const t of styles) {
+        if (!t || t === 'none') continue;
+        // matrix(a,b,c,d,tx,ty)
+        const m2 = t.match(/^matrix\(([-0-9., e]+)\)$/);
+        if (m2) {
+          const [a,b] = m2[1].split(',').map(parseFloat);
+          const deg = Math.atan2(b, a) * 180/Math.PI;
+          return (deg + 360) % 360;
+        }
+        // matrix3d(m11, m12, m13, ...)
+        const m3 = t.match(/^matrix3d\(([-0-9., e]+)\)$/);
+        if (m3) {
+          const parts = m3[1].split(',').map(parseFloat);
+          const a = parts[0], b = parts[1]; // m11, m12
+          const deg = Math.atan2(b, a) * 180/Math.PI;
+          return (deg + 360) % 360;
+        }
+      }
+      return null;
+    }
+
+    // Calibrate: compare current compass rotation to true bearing from API
+    async function calibrateBearing(imageId) {
       try {
-        if (viewer?.getState) {
-          const st = await viewer.getState();
-          let yaw = st?.pov?.yaw ?? st?.bearing ?? null;
-          let fov = st?.pov?.fov ?? st?.fov ?? null;
-          if (typeof yaw === 'number' && Math.abs(yaw) <= Math.PI * 2) yaw = yaw * 180/Math.PI;
-          if (typeof fov === 'number' && fov <= Math.PI * 2) fov = f * 180/Math.PI;
-          if (typeof fov === 'number') currentFovDeg = Math.min(140, Math.max(10, fov));
-          if (typeof yaw === 'number') {
-            const yawDeg = ((yaw % 360) + 360) % 360;
-            const pos = marker.getLatLng();
-            drawOrientation(pos.lat, pos.lng, yawDeg, currentFovDeg, 50);
-            lastYaw = yawDeg;
-            dbg(`poll\nyaw=${yawDeg.toFixed(1)}°\nfov=${currentFovDeg.toFixed(1)}°`);
+        const url = new URL(`https://graph.mapillary.com/${imageId}`);
+        url.searchParams.set("fields","computed_geometry,computed_compass_angle");
+        const res = await fetch(url, { headers:{ Authorization:`OAuth ${TOKEN}` }});
+        if (!res.ok) return;
+        const j = await res.json();
+        const coords = j?.computed_geometry?.coordinates;
+        const bearing = j?.computed_compass_angle;
+        if (coords?.length === 2) {
+          const latlng = [coords[1], coords[0]];
+          marker.setLatLng(latlng);
+          if (VIEW !== 'image') map.setView(latlng, map.getZoom(), { animate:true });
+        }
+        if (typeof bearing === 'number') {
+          // wait until the compass DOM exists & has a rotation
+          if (!compassEl) compassEl = findCompassEl();
+          let rot = getRotationDeg(compassEl);
+          let tries = 0;
+          while ((rot == null || isNaN(rot)) && tries < 20) {
+            await new Promise(r => setTimeout(r, 100));
+            if (!compassEl) compassEl = findCompassEl();
+            rot = getRotationDeg(compassEl);
+            tries++;
+          }
+          if (rot != null) {
+            // We want: cameraBearing (from API) == compassOffset + rot  (mod 360)
+            compassOffset = ((bearing - rot) % 360 + 360) % 360;
+            // draw initial wedge
+            const latlng = marker.getLatLng();
+            drawOrientation(latlng.lat, latlng.lng, (compassOffset + rot) % 360, FOV_DEG_DEFAULT, 50);
+            dbg(`calibrated\napi=${bearing.toFixed(1)}°\nrot=${rot.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°`);
           }
         }
       } catch {}
     }
 
+    // Poll the compass rotation and update the wedge
+    function startCompassWatcher() {
+      setInterval(() => {
+        if (!compassEl) compassEl = findCompassEl();
+        const rot = getRotationDeg(compassEl);
+        if (rot == null || compassOffset == null) return;
+        const bearing = (compassOffset + rot) % 360;    // camera facing
+        const pos = marker.getLatLng();
+        drawOrientation(pos.lat, pos.lng, bearing, FOV_DEG_DEFAULT, 50);
+        dbg(`live compass\nrot=${rot.toFixed(1)}°\nbearing=${bearing.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°`);
+      }, 120); // ~8 fps, adjust as you like
+    }
+
+    // Navigation helper
     async function gotoImage(id, latlngHint) {
-      const myLock = ++navLock;
+      const my = ++navLock;
       try { await viewer.setFilter(["all"]); } catch {}
       try {
         await viewer.moveTo(id);
         if (latlngHint) {
           marker.setLatLng([latlngHint[0], latlngHint[1]]);
-          if (VIEW !== 'image') map.setView(latlngHint, map.getZoom(), { animate: true });
+          if (VIEW !== 'image') map.setView(latlngHint, map.getZoom(), { animate:true });
         }
-        // Kick a POV poll right after navigation (helps on builds without events)
-        setTimeout(pollViewerPovOnce, 50);
+        // re-calibrate after jumps (compass rotation may change abruptly)
+        calibrateBearing(id);
       } finally {
-        if (navLock === myLock) navLock = 0;
+        if (navLock === my) navLock = 0;
       }
     }
 
     (async function init(){
-      if (!TOKEN) {
-        status(SHOW_PINS ? "Add ?token=YOUR_TOKEN to enable navigation; pins will not load without a token."
-                         : "Map only: add ?view=split (or image) and ?token=YOUR_TOKEN to enable the viewer.");
-        return;
-      }
-
+      if (!TOKEN) { status("Add ?token=YOUR_TOKEN"); return; }
       const M = window.Mapillary || window.mapillary || window.mapillaryjs;
       const ViewerCtor = M && M.Viewer;
       if (!ViewerCtor) { status("Mapillary library failed to load."); return; }
 
-      viewer = new ViewerCtor({ container: "mly", accessToken: TOKEN });
+      viewer = new ViewerCtor({ container:"mly", accessToken:TOKEN });
+      try { viewer.setFieldOfView(FOV_DEG_DEFAULT); } catch {}
 
+      status("Searching for a nearby image…");
+      const start = await findImageNear({ lat: defaults.lat, lng: defaults.lng });
+      if (!start) { status(`No imagery by "${defaults.username}" near start.`); return; }
+
+      await gotoImage(start.id);
+      status("");
+
+      // Re-draw/map sync on image change (and recalibrate)
       try {
-        status("Searching for a nearby image…");
-        const start = await findImageNear({ lat: defaults.lat, lng: defaults.lng });
-        if (!start) { status(`No imagery by "${defaults.username}" near ${defaults.lat.toFixed(5)}, ${defaults.lng.toFixed(5)}.`); return; }
+        viewer.on('image', (ev) => {
+          const id = ev?.image?.id || ev?.imageId || ev?.id;
+          if (id) calibrateBearing(id);
+        });
+      } catch {}
 
-        await gotoImage(start.id);
-        status("");
+      // Initial calibration & start compass watcher
+      calibrateBearing(start.id);
+      startCompassWatcher();
 
-        // Initial viewer FOV
-        try { viewer.setFieldOfView(FOV_DEG_DEFAULT); currentFovDeg = FOV_DEG_DEFAULT; } catch {}
-
-        // Image → map sync (position + initial bearing)
-        async function syncMap(imageId) {
-          try {
-            const url = new URL(`https://graph.mapillary.com/${imageId}`);
-            url.searchParams.set("fields", "computed_geometry,computed_compass_angle");
-            const res = await fetch(url, { headers: { Authorization: `OAuth ${TOKEN}` }});
-            if (!res.ok) return;
-            const j = await res.json();
-            const coords = j?.computed_geometry?.coordinates; // [lon, lat]
-            const bearing = j?.computed_compass_angle;        // 0..360
-            if (coords && coords.length === 2) {
-              const latlng = [coords[1], coords[0]];
-              marker.setLatLng(latlng);
-              if (VIEW !== 'image') map.setView(latlng, map.getZoom(), { animate: true });
-              const yawDeg = (typeof bearing === 'number') ? bearing : (lastYaw ?? 0);
-              drawOrientation(latlng[0], latlng[1], yawDeg, currentFovDeg, 50);
-              lastYaw = yawDeg;
-            }
-          } catch {}
-        }
-
-        await syncMap(start.id);
-
-        // Listen for image changes
-        try {
-          viewer.on('image', (ev) => {
-            if (navLock) return;
-            const id = ev?.image?.id || ev?.imageId || ev?.id;
-            if (id) { lastYaw = null; syncMap(id); setTimeout(pollViewerPovOnce, 50); }
-          });
-        } catch {
-          // Fallback polling of current image id if no event
-          setInterval(async () => {
-            if (navLock) return;
-            try { const id = (await viewer.getState?.())?.imageId; if (id) { lastYaw = null; syncMap(id); } } catch {}
-          }, 1200);
-        }
-
-        // Hook into POV/FOV events (if the build supports them)
-        bindPovListeners();
-
-        // As a safety net, poll POV at a slow cadence (covers builds without events)
-        setInterval(pollViewerPovOnce, 400);
-
-        if (SHOW_PINS) drawPinsForView();
-
-      } catch (e) {
-        console.error(e);
-        status("Error: " + (e?.message || e));
-      }
+      if (SHOW_PINS) drawPinsForView();
     })();
   </script>
 </body>
