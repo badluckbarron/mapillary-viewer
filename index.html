@@ -47,6 +47,7 @@
     const VIEW = (qs.get("view") || "image").toLowerCase();      // image | map | split
     const SHOW_PINS = (qs.get("pins") || "").toLowerCase() === "all";
     const FOV_DEG_DEFAULT = Number(qs.get("fov") ?? 60); // default wedge & viewer FOV
+    let currentFovDeg = FOV_DEG_DEFAULT;
 
     const status = (t) => { document.getElementById('msg').textContent = t || ""; };
 
@@ -194,31 +195,42 @@
 
     // Try to read yaw/FOV from the viewer (supports multiple MJS builds)
     async function readViewerYawFov() {
-      try {
-        // 1) Common: getState() may expose pov.yaw / fov or bearing
-        if (viewer?.getState) {
-          const st = await viewer.getState();
-          let yaw = st?.pov?.yaw ?? st?.bearing ?? null;
-          let fov = st?.pov?.fov ?? st?.fov ?? null;
-          // Heuristic: if yaw looks like radians, convert to degrees
-          if (typeof yaw === 'number' && Math.abs(yaw) <= Math.PI * 2) yaw = yaw * 180 / Math.PI;
-          if (typeof fov === 'number' && fov <= Math.PI * 2) fov = fov * 180 / Math.PI;
-          return { yawDeg: (typeof yaw === 'number') ? ((yaw % 360) + 360) % 360 : null,
-                   fovDeg: (typeof fov === 'number') ? fov : null };
-        }
-        // 2) Older builds: getPointOfView()
-        if (viewer?.getPointOfView) {
-          const pov = viewer.getPointOfView();
-          let yaw = pov?.yaw;
-          let fov = pov?.fov;
-          if (typeof yaw === 'number' && Math.abs(yaw) <= Math.PI * 2) yaw = yaw * 180 / Math.PI;
-          if (typeof fov === 'number' && fov <= Math.PI * 2) fov = fov * 180 / Math.PI;
-          return { yawDeg: (typeof yaw === 'number') ? ((yaw % 360) + 360) % 360 : null,
-                   fovDeg: (typeof fov === 'number') ? fov : null };
-        }
-      } catch {}
-      return { yawDeg: null, fovDeg: null };
+  try {
+    // Try explicit getters first
+    if (typeof viewer?.getFieldOfView === 'function' || typeof viewer?.getState === 'function' || typeof viewer?.getPointOfView === 'function') {
+      // FOV
+      let fovDeg = null;
+      if (typeof viewer.getFieldOfView === 'function') {
+        let f = viewer.getFieldOfView();                 // may be deg or rad
+        fovDeg = (typeof f === 'number' && f <= Math.PI * 2) ? (f * 180 / Math.PI) : f;
+      }
+      // State/POV (for yaw and backup FOV)
+      let yawDeg = null;
+      if (typeof viewer.getState === 'function') {
+        const st = await viewer.getState();
+        let y = st?.pov?.yaw ?? st?.bearing ?? null;
+        let f = st?.pov?.fov ?? st?.fov ?? null;
+        if (typeof y === 'number' && Math.abs(y) <= Math.PI * 2) y = y * 180 / Math.PI;
+        if (typeof f === 'number' && f <= Math.PI * 2) f = f * 180 / Math.PI;
+        if (y != null) yawDeg = ((y % 360) + 360) % 360;
+        if (fovDeg == null && f != null) fovDeg = f;
+      } else if (typeof viewer.getPointOfView === 'function') {
+        const pov = viewer.getPointOfView();
+        let y = pov?.yaw, f = pov?.fov;
+        if (typeof y === 'number' && Math.abs(y) <= Math.PI * 2) y = y * 180 / Math.PI;
+        if (typeof f === 'number' && f <= Math.PI * 2) f = f * 180 / Math.PI;
+        if (y != null) yawDeg = ((y % 360) + 360) % 360;
+        if (fovDeg == null && f != null) fovDeg = f;
+      }
+
+      // Clamp to reasonable range
+      if (typeof fovDeg === 'number') fovDeg = Math.min(140, Math.max(10, fovDeg));
+      return { yawDeg, fovDeg };
     }
+  } catch {}
+  return { yawDeg: null, fovDeg: null };
+}
+
 
     function startYawWatcher() {
       if (yawTimer) clearInterval(yawTimer);
