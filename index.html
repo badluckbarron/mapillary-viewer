@@ -138,7 +138,7 @@
     }
 
     async function fetchImagesInBbox({bbox, cap=MAX_PINS}){
-      const PAGE=100; let out=[];
+      const PAGE=2000; let out=[];
       let url=new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields","id,computed_geometry");
       url.searchParams.set("bbox", bbox.join(","));
