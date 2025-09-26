@@ -87,7 +87,7 @@
     }).addTo(map);
     const startLatLng = [defaults.lat, defaults.lng];
 
-    // Slightly more zoomed out than your previous 16 → use 14
+    // Slightly more zoomed out than 16 → use 14
     const initialZoom = Math.max(0, (defaults.z || 16) - 2);
     map.setView(startLatLng, initialZoom);
 
@@ -140,7 +140,7 @@
       L.polyline([[lat,lng],tip],{color:'#1976d2',weight:2,opacity:.9}).addTo(orientationLayer);
     }
 
-    // Distance helpers
+    // Distance + angle helpers
     function metersToDeg(lat, m){
       const dLat = m / 111320;
       const dLng = m / (111320 * Math.cos(lat * Math.PI/180) || 1e-6);
@@ -158,8 +158,9 @@
     }
 
     // ------------------ Graph API (pins + image coords) ------------------
-    // Find nearest image ONLY within a bbox; among candidates, prefer compass near BEARING_TARGET
-    async function findImageNearWithinMeters({lat, lng, meters=MAX_START_METERS, cap=80}){
+    // ANGLE-FIRST: prefer frames whose compass is nearest to BEARING_TARGET (0° = north),
+    // then break ties by distance; only search within MAX_START_METERS.
+    async function findImageNearWithinMeters({lat, lng, meters=MAX_START_METERS, cap=120, target=BEARING_TARGET}){
       const { dLat, dLng } = metersToDeg(lat, meters);
       const bbox = [lng - dLng, lat - dLat, lng + dLng, lat + dLat]; // [minX,minY,maxX,maxY]
 
@@ -174,22 +175,25 @@
       const j = await res.json();
       const arr = Array.isArray(j?.data) ? j.data : [];
 
-      let best = null;
-      let bestKey = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]; // [distance, angularDiff]
-      for (const img of arr){
+      const withMetrics = arr.map(img => {
         const c = img?.computed_geometry?.coordinates;
-        if (!c) continue;
+        if (!c) return null;
         const latlng = [c[1], c[0]];
         const d = haversineMeters([lat, lng], latlng);
-        const compass = typeof img?.computed_compass_angle === "number" ? img.computed_compass_angle : null;
-        const ad = compass == null ? 180 : angDiffDeg(compass, BEARING_TARGET);
-        const key = [d, ad];
-        if (key[0] < bestKey[0] || (key[0] === bestKey[0] && key[1] < bestKey[1])){
-          best = { id: img.id, latlng, d, compass };
-          bestKey = key;
-        }
-      }
-      return best; // null if none in range
+        const comp = (typeof img?.computed_compass_angle === "number") ? img.computed_compass_angle : null;
+        const ang = comp == null ? 999 : angDiffDeg(comp, target); // de-prioritize if unknown
+        return { id: img.id, latlng, d, compass: comp, ang };
+      }).filter(Boolean);
+
+      if (!withMetrics.length) return null;
+
+      withMetrics.sort((a, b) => (a.ang - b.ang) || (a.d - b.d));
+      const best = withMetrics[0];
+
+      // Optional status to see what we picked
+      status(`Start image: ~${best.ang.toFixed(0)}° from north, ${Math.round(best.d)} m away`);
+
+      return best;
     }
 
     async function getImageLatLng(imageId){
@@ -405,7 +409,7 @@
         });
       } catch {}
 
-      // Move to the start image that is actually within range (and closest to north)
+      // Move to the start image that is actually within range (chosen by angle-first)
       await gotoImage(start.id, start.latlng);
 
       // initial marker + anchor (redundant safe-guard)
