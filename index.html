@@ -53,7 +53,7 @@
     const SHOW_PINS     = (qs.get("pins") || "").toLowerCase() === "all";
     const FOV_DEG       = Number(qs.get("fov") ?? 60);
     const DEBUG         = qs.get("debug") === "1";
-    const MAX_PINS      = Number(qs.get("maxPins") ?? 500);
+    const MAX_PINS      = Number(qs.get("maxPins") ?? 2000);
     const START_BEARING = ((Number(qs.get("bearing")) || 0) + 360) % 360; // default 0°
     const FOLLOW_MAP    = (qs.get("follow") ?? "1") !== "0";              // auto-pan map (default on)
 
