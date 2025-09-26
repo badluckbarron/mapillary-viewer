@@ -52,7 +52,7 @@
     const SHOW_PINS = (qs.get("pins") || "").toLowerCase() === "all";
     const FOV_DEG   = Number(qs.get("fov") ?? 60);
     const DEBUG     = qs.get("debug") === "1";
-    const MAX_PINS  = Number(qs.get("maxPins") ?? 500);      // you can override via ?maxPins=
+    const MAX_PINS  = Number(qs.get("maxPins") ?? 500);
 
     const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
     const dbg    = (t)=>{ const el=document.getElementById('dbg'); if (DEBUG){ el.style.display='block'; el.textContent=t; } };
@@ -162,10 +162,10 @@
 
     // Compass reading
     let viewer, navLock=0;
-    let compassEl=null;
-    let compassOffset=null;
-    let suspendWatcher=false;     // <— NEW: pause live updates during calibration
-    let calibratingId=null;       // <— NEW: cancel stale calibrations
+    let compassEl=null;           // current compass DOM node (gets replaced by the viewer!)
+    let compassOffset=null;       // per-image offset: bearing = (offset + rot) % 360
+    let suspendWatcher=false;     // pause live updates during calibration
+    let calibratingId=null;
 
     function findCompassEl(){
       const host=document.getElementById('mly'); if(!host) return null;
@@ -176,6 +176,7 @@
           || host.querySelector('[class*="bearing-indicator"]')
           || host.querySelector('[class*="compass"]');
     }
+
     function getRotationDeg(rootEl){
       if(!rootEl) return null;
       const q=[rootEl]; let depth=0, nextBreak=1, count=0, maxDepth=3;
@@ -198,13 +199,15 @@
         return null;
       }
     }
+
     const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
     const nextFrame = ()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
 
+    // Always re-query the compass node during calibration (it may be a new element)
     async function readStableCompassRotation(maxWaitMs=3500){
       const t0=performance.now(); let last=null, stable=0, rot=null;
       while(performance.now()-t0<maxWaitMs){
-        if(!compassEl) compassEl=findCompassEl();
+        compassEl = findCompassEl();            // <-- refresh every read
         rot=getRotationDeg(compassEl);
         if(rot!=null){
           const diff= last==null ? 999 : Math.abs(((rot-last+540)%360)-180);
@@ -221,6 +224,7 @@
       calibratingId = imageId;
       suspendWatcher = true;
       compassOffset = null;
+      compassEl = null;                 // <-- drop the old node
       orientationLayer.clearLayers();
 
       try{
@@ -240,19 +244,17 @@
         }
 
         // 2) Ensure the NEW image is rendered before reading the compass
-        await nextFrame();                         // 2 frames to let DOM swap images
-        if(calibratingId !== imageId) return;      // a newer calibration started
+        await nextFrame();
+        if(calibratingId !== imageId) return;
 
-        const rot = await readStableCompassRotation();
+        const rot = await readStableCompassRotation();  // refreshes compassEl internally
         if(calibratingId !== imageId) return;
         if(rot==null) return;
 
         if(typeof apiBearing === 'number'){
           compassOffset = ((apiBearing - rot) % 360 + 360) % 360;
-
-          // snap wedge to the true bearing right away
           const p=marker.getLatLng();
-          drawOrientation(p.lat, p.lng, apiBearing, FOV_DEG, 50);
+          drawOrientation(p.lat, p.lng, apiBearing, FOV_DEG, 50); // snap to true bearing
           if(DEBUG) dbg(`calibrated\napi=${apiBearing.toFixed(1)}°\nrot=${rot.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°`);
         }else{
           const p=marker.getLatLng();
@@ -270,11 +272,11 @@
     function startCompassWatcher(){
       setInterval(()=>{
         if(suspendWatcher) return;
-        if(!compassEl) compassEl=findCompassEl();
+        compassEl = findCompassEl();                 // <-- refresh in case the node was swapped
         const rot=getRotationDeg(compassEl); if(rot==null) return;
 
         const bearing = compassOffset!=null ? (compassOffset + rot) % 360
-                                            : (360 - rot) % 360; // very brief pre-cal
+                                            : (360 - rot) % 360; // brief pre-cal
         const pos=marker.getLatLng();
         drawOrientation(pos.lat, pos.lng, bearing, FOV_DEG, 50);
         if(DEBUG) dbg(`live compass\nrot=${rot.toFixed(1)}°\nbearing=${bearing.toFixed(1)}°\noffset=${(compassOffset??0).toFixed(1)}°`);
@@ -286,9 +288,11 @@
       const my=++navLock;
       try{ await viewer.setFilter(["all"]); }catch{}
       try{
-        // Pause updates and clear any stale offset during the jump
+        // Pause updates and clear any stale refs during the jump
         suspendWatcher = true;
         compassOffset = null;
+        compassEl = null;                            // <-- force re-find on next read
+        orientationLayer.clearLayers();
 
         await viewer.moveTo(id);
 
@@ -296,9 +300,7 @@
           marker.setLatLng([latlngHint[0], latlngHint[1]]);
           if(VIEW!=='image') map.setView(latlngHint, map.getZoom(), {animate:true});
         }
-
-        // Let the 'image' event trigger calibration; this avoids racing.
-        // (We do NOT call calibrateBearing here to prevent old-compass reads.)
+        // Let the 'image' event trigger calibration (prevents races)
       } finally {
         if(navLock===my) navLock=0;
       }
@@ -318,10 +320,11 @@
       const start=await findImageNear({lat:defaults.lat, lng:defaults.lng});
       if(!start){ status(`No imagery by "${defaults.username}" near start.`); return; }
 
-      // when the viewer actually switches image, (re)calibrate
+      // On actual image change, re-calibrate (and refresh the compass node)
       try {
         viewer.on('image', (ev)=>{
           const id=ev?.image?.id || ev?.imageId || ev?.id;
+          compassEl = null;                           // <-- refresh per-image
           if(id) calibrateBearing(id);
         });
       } catch {}
