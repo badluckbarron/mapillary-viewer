@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>MapillaryJS – compass-synced wedge (stable + bg compass)</title>
+  <title>MapillaryJS – sticky wedge (keeps angle across photos)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -40,7 +40,7 @@
   </div>
 
   <script>
-    // ---- Query/options ----
+    // ------------------ Query/options ------------------
     const qs = new URLSearchParams(location.search);
     const TOKEN = qs.get("token") || "";
     const defaults = {
@@ -54,20 +54,20 @@
     const FOV_DEG   = Number(qs.get("fov") ?? 60);
     const DEBUG     = qs.get("debug") === "1";
     const MAX_PINS  = Number(qs.get("maxPins") ?? 500);
+    const START_BEARING = ((Number(qs.get("bearing")) || 0) + 360) % 360; // default 0°
 
     const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
     const dbg    = (t)=>{ const el=document.getElementById('dbg'); if (DEBUG){ el.style.display='block'; el.textContent=t; } };
 
-    // ---- Layout ----
+    // ------------------ Layout ------------------
     const wrap = document.getElementById('wrap');
     wrap.className = VIEW === 'split' ? 'split' : (VIEW === 'map' ? 'map-only' : 'image-only');
 
     const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
     const nextFrame = ()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
-
     function zoomToMeters(z){ return 500000 / Math.pow(2, z); }
 
-    // ---- Leaflet map ----
+    // ------------------ Leaflet map ------------------
     const map = L.map('map', { zoomControl:true, attributionControl:true });
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
@@ -84,7 +84,7 @@
       fillColor: '#2ecc71', fillOpacity: 0.9, className: 'pin'
     };
 
-    // ---- Helpers ----
+    // ------------------ Helpers ------------------
     function bboxFromMap(m){ const b=m.getBounds(), sw=b.getSouthWest(), ne=b.getNorthEast(); return [sw.lng, sw.lat, ne.lng, ne.lat]; }
     function destPoint(lat,lng,bearingDeg,meters){
       const R=6371000, br=bearingDeg*Math.PI/180;
@@ -104,7 +104,7 @@
       L.polyline([[lat,lng],tip],{color:'#1976d2',weight:2,opacity:.9}).addTo(orientationLayer);
     }
 
-    // ---- Mapillary Graph API ----
+    // ------------------ Graph API (pins) ------------------
     async function findImageNear({lat,lng}){
       const url=new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields","id,computed_geometry");
@@ -112,8 +112,7 @@
       url.searchParams.set("radius", Math.max(25, Math.round(zoomToMeters(defaults.z))));
       url.searchParams.set("limit","1");
       if(defaults.username) url.searchParams.set("creator_username", defaults.username);
-      const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}});
-      if(!res.ok) throw new Error(`API ${res.status}`);
+      const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}}); if(!res.ok) throw new Error(`API ${res.status}`);
       const j=await res.json(); return j?.data?.[0] ?? null;
     }
 
@@ -125,14 +124,10 @@
       url.searchParams.set("limit", String(Math.min(PAGE, cap)));
       if(defaults.username) url.searchParams.set("creator_username", defaults.username);
       while(url && out.length<cap){
-        const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}});
-        if(!res.ok) throw new Error(`API ${res.status}`);
-        const j=await res.json();
-        if(Array.isArray(j.data)) out.push(...j.data);
-        const next=j?.paging?.next;
-        if(!next || out.length>=cap) break;
-        url=new URL(next);
-        url.searchParams.set("limit", String(Math.min(PAGE, cap - out.length)));
+        const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}}); if(!res.ok) throw new Error(`API ${res.status}`);
+        const j=await res.json(); if(Array.isArray(j.data)) out.push(...j.data);
+        const next=j?.paging?.next; if(!next || out.length>=cap) break;
+        url=new URL(next); url.searchParams.set("limit", String(Math.min(PAGE, cap - out.length)));
       }
       return out.slice(0, cap);
     }
@@ -165,13 +160,8 @@
       }catch(err){ console.error(err); status("Error searching."); }
     });
 
-    // ---- Compass reading & synchronization ----
-    let viewer, navLock=0;
-    let compassOffset=null;       // per-image offset: bearing = (offset + rot) % 360
-    let suspendWatcher=false;     // pause live updates during calibration
-    let calibratingId=null;
-
-    // Low-level: parse a CSS transform string to degrees
+    // ------------------ Compass reading (DOM) ------------------
+    // Parse CSS transform → degrees
     function getRotationDeg(rootEl){
       if(!rootEl) return null;
       const q=[rootEl]; let depth=0, nextBreak=1, count=0, maxDepth=3;
@@ -186,7 +176,7 @@
       function parseTransformToDeg(tr){
         if(!tr || tr==='none') return null;
         const r=/rotate[Z]?\(\s*([-+0-9.]+)\s*(deg|rad)\s*\)/i.exec(tr);
-        if(r){ const v=parseFloat(r[1]); return r[2].toLowerCase()==='rad' ? v*180/Math.PI : v; }
+        if(r){ const v=parseFloat(r[1]); return r[2].toLowerCase()==='rad'? v*180/Math.PI : v; }
         const m2=/^matrix\(\s*([-+0-9eE.,\s]+)\)$/.exec(tr);
         if(m2){ const [a,b]=m2[1].split(',').map(x=>parseFloat(x)); return Math.atan2(b,a)*180/Math.PI; }
         const m3=/^matrix3d\(\s*([-+0-9eE.,\s]+)\)$/.exec(tr);
@@ -195,28 +185,24 @@
       }
     }
 
-    // NEW: prefer the background ring for rotation; fallback to north arrow.
+    // Prefer the compass background ring; fall back if needed
     function getCompassRotation(){
       const host=document.getElementById('mly');
-      const trySel=(sel,src)=>{
-        const el=host && host.querySelector(sel);
-        const deg=getRotationDeg(el);
-        return deg!=null ? { rot: ((deg%360)+360)%360, src } : null;
-      };
+      const trySel=(sel,src)=>{ const el=host && host.querySelector(sel); const deg=getRotationDeg(el);
+        return deg!=null ? {rot:((deg%360)+360)%360, src} : null; };
       return (
         trySel('.mapillary-bearing-indicator-background','bg') ||
         trySel('.mapillary-bearing-indicator-background-arrow','bg-arrow') ||
         trySel('.mapillary-bearing-north-container','north') ||
         trySel('[class*="bearing"]','fallback') ||
-        { rot:null, src:'none' }
+        {rot:null, src:'none'}
       );
     }
 
-    // Wait until the compass rotation stops animating
     async function readStableCompassRotation(maxWaitMs=3500){
       const t0=performance.now(); let last=null, stable=0; let result={rot:null,src:'none'};
       while(performance.now()-t0<maxWaitMs){
-        const r=getCompassRotation();   // re-check which node is valid on EVERY read
+        const r=getCompassRotation();
         if(r.rot!=null){
           const diff= last==null ? 999 : Math.abs(((r.rot-last+540)%360)-180);
           if(diff<0.5){ if(++stable>=3) return r; }
@@ -224,94 +210,61 @@
         }
         await sleep(100);
       }
-      return result;                    // best-effort
+      return result; // best-effort
     }
 
-    // Recalibrate per image AFTER the new image is mounted & compass is stable
-    async function calibrateBearing(imageId){
-      calibratingId = imageId;
+    // ------------------ Sticky wedge logic ------------------
+    let viewer, navLock=0;
+    let compassOffset=0;              // wedgeBearing = (compassOffset + rot) % 360
+    let stickyBearing=START_BEARING;  // the last drawn wedge bearing we want to preserve across photos
+    let suspendWatcher=false;         // pause live updates during anchoring
+
+    // Anchor the new image so that the wedge keeps the previous stickyBearing
+    async function reanchorToSticky(){
       suspendWatcher = true;
-      compassOffset = null;
-      orientationLayer.clearLayers();
-
-      try{
-        // 1) Get true bearing + geometry
-        const u=new URL(`https://graph.mapillary.com/${imageId}`);
-        u.searchParams.set("fields","computed_geometry,computed_compass_angle");
-        const res=await fetch(u,{headers:{Authorization:`OAuth ${TOKEN}`}});
-        if(!res.ok) return;
-        const j=await res.json();
-        const coords=j?.computed_geometry?.coordinates;
-        const apiBearing=j?.computed_compass_angle;
-
-        if(coords?.length===2){
-          const latlng=[coords[1],coords[0]];
-          marker.setLatLng(latlng);
-          if(VIEW!=='image') map.setView(latlng, map.getZoom(), {animate:true});
-        }
-
-        // 2) Ensure the NEW image is rendered before reading the compass
-        await nextFrame();
-        if(calibratingId !== imageId) return;
-
-        const { rot, src } = await readStableCompassRotation();
-        if(calibratingId !== imageId) return;
-        if(rot==null) return;
-
-        if(typeof apiBearing === 'number'){
-          compassOffset = ((apiBearing - rot) % 360 + 360) % 360;
-          const p=marker.getLatLng();
-          drawOrientation(p.lat, p.lng, apiBearing, FOV_DEG, 50); // snap to true bearing
-          if(DEBUG) dbg(`calibrated\napi=${apiBearing.toFixed(1)}°\nrot=${rot.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°\nsrc=${src}`);
-        }else{
-          const p=marker.getLatLng();
-          const bearing=(360-rot)%360;
-          drawOrientation(p.lat, p.lng, bearing, FOV_DEG, 50);
-          if(DEBUG) dbg(`calibrated(fallback)\nrot=${rot.toFixed(1)}°\nbearing≈${bearing.toFixed(1)}°\nsrc=${src}`);
-        }
-      } catch(e){ console.error(e); }
-      finally{
-        if(calibratingId === imageId) { suspendWatcher = false; }
+      await nextFrame();                         // let the new image mount
+      const {rot, src} = await readStableCompassRotation();
+      if(rot!=null){
+        compassOffset = ((stickyBearing - rot) % 360 + 360) % 360;
+        const p=marker.getLatLng();
+        drawOrientation(p.lat, p.lng, stickyBearing, FOV_DEG, 50);
+        if (DEBUG) dbg(`reanchor\nrot=${rot.toFixed(1)}°\nsticky=${stickyBearing.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°\nsrc=${src}`);
       }
+      suspendWatcher = false;
     }
 
-    // Live watcher (paused during calibration)
+    // Live watcher: follow viewer rotation; keep stickyBearing updated
     function startCompassWatcher(){
       setInterval(()=>{
         if(suspendWatcher) return;
-        const { rot, src } = getCompassRotation();
+        const {rot, src} = getCompassRotation();
         if(rot==null) return;
-
-        const bearing = compassOffset!=null ? (compassOffset + rot) % 360
-                                            : (360 - rot) % 360; // brief pre-cal
+        const bearing = (compassOffset + rot) % 360;   // live wedge
+        stickyBearing = bearing;                       // remember for next photo
         const pos=marker.getLatLng();
         drawOrientation(pos.lat, pos.lng, bearing, FOV_DEG, 50);
-        if(DEBUG) dbg(`live compass\nrot=${rot.toFixed(1)}°\nbearing=${bearing.toFixed(1)}°\noffset=${(compassOffset??0).toFixed(1)}°\nsrc=${src}`);
+        if (DEBUG) dbg(`live\nrot=${rot.toFixed(1)}°\nbearing=${bearing.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°\nsrc=${src}`);
       }, 120);
     }
 
-    // Navigation
+    // ------------------ Navigation ------------------
     async function gotoImage(id, latlngHint){
       const my=++navLock;
       try{ await viewer.setFilter(["all"]); }catch{}
       try{
         suspendWatcher = true;
-        compassOffset = null;
-        orientationLayer.clearLayers();
-
         await viewer.moveTo(id);
-
         if(latlngHint){
           marker.setLatLng([latlngHint[0], latlngHint[1]]);
           if(VIEW!=='image') map.setView(latlngHint, map.getZoom(), {animate:true});
         }
-        // 'image' event will trigger calibration
+        // reanchor when the viewer confirms image change (below)
       } finally {
         if(navLock===my) navLock=0;
       }
     }
 
-    // Init
+    // ------------------ Init ------------------
     (async function init(){
       if(!TOKEN){ status("Add ?token=YOUR_TOKEN"); return; }
       const M=window.Mapillary || window.mapillary || window.mapillaryjs;
@@ -319,21 +272,23 @@
       if(!ViewerCtor){ status("Mapillary library failed to load."); return; }
 
       viewer=new ViewerCtor({ container:"mly", accessToken:TOKEN });
+
       try{ viewer.setFieldOfView(FOV_DEG); }catch{}
 
       status("Searching for a nearby image…");
       const start=await findImageNear({lat:defaults.lat, lng:defaults.lng});
       if(!start){ status(`No imagery by "${defaults.username}" near start.`); return; }
 
-      // On actual image change, re-calibrate
+      // On image change: reanchor to keep the previous angle
       try {
-        viewer.on('image', (ev)=>{
+        viewer.on('image', async (ev)=>{
           const id=ev?.image?.id || ev?.imageId || ev?.id;
-          if(id) calibrateBearing(id);
+          if(id) await reanchorToSticky();
         });
       } catch {}
 
       await gotoImage(start.id);
+      await reanchorToSticky();   // initial anchor to START_BEARING (default 0°)
       status("");
 
       startCompassWatcher();
