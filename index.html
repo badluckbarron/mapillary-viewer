@@ -42,15 +42,18 @@
   <script>
     // ------------------ Query/options ------------------
     const qs = new URLSearchParams(location.search);
+
+    // (Hard-coded token/opts for your demo)
     const TOKEN = "MLY%7C24462366120070331%7C7b445698e786aaa212354b607653e542";
     const defaults = {
-      lat: Number( 30.138307),
+      lat: Number(30.138307),
       lng: Number(-91.965153),
       z:   Number(16),
       username: "HKocen"
     };
+
     const VIEW          = "split";     // image | map | split
-    const SHOW_PINS     = "all";
+    const SHOW_PINS     = "all";       // truthy => show
     const FOV_DEG       = Number(60);
     const DEBUG         = qs.get("debug") === "1";
     const MAX_PINS      = Number(2000);
@@ -59,6 +62,9 @@
 
     // +1 => wedge follows north arrow; -1 => wedge follows camera yaw (opposite of north arrow)
     const ROT_SIGN = (-1);
+
+    // NEW: only start on an image if within this distance (meters)
+    const MAX_START_METERS = Number(qs.get("maxStartMeters") ?? 250);
 
     const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
     const dbg    = (t)=>{ const el=document.getElementById('dbg'); if (DEBUG){ el.style.display='block'; el.textContent=t; } };
@@ -77,7 +83,9 @@
       maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
     const startLatLng = [defaults.lat, defaults.lng];
-    map.setView(startLatLng, 13);
+
+    // Respect defaults.z
+    map.setView(startLatLng, defaults.z || 13);
 
     const marker = L.marker(startLatLng, { draggable:false }).addTo(map);
     const pinLayer = L.layerGroup().addTo(map);
@@ -130,16 +138,46 @@
       L.polyline([[lat,lng],tip],{color:'#1976d2',weight:2,opacity:.9}).addTo(orientationLayer);
     }
 
+    // Distance helpers for start selection
+    function metersToDeg(lat, m){
+      const dLat = m / 111320;
+      const dLng = m / (111320 * Math.cos(lat * Math.PI/180) || 1e-6);
+      return { dLat, dLng };
+    }
+    function haversineMeters(a, b){
+      const R=6371000, toRad=Math.PI/180;
+      const dLat=(b[0]-a[0])*toRad, dLng=(b[1]-a[1])*toRad;
+      const s1=Math.sin(dLat/2), s2=Math.sin(dLng/2);
+      const c1=Math.cos(a[0]*toRad)*Math.cos(b[0]*toRad);
+      return 2*R*Math.asin(Math.sqrt(s1*s1 + c1*s2*s2));
+    }
+
     // ------------------ Graph API (pins + image coords) ------------------
-    async function findImageNear({lat,lng}){
-      const url=new URL("https://graph.mapillary.com/images");
-      url.searchParams.set("fields","id,computed_geometry");
-      url.searchParams.set("closeto", `${lng},${lat}`);
-      url.searchParams.set("radius", Math.max(25, Math.round(zoomToMeters(defaults.z))));
-      url.searchParams.set("limit","1");
-      if(defaults.username) url.searchParams.set("creator_username", defaults.username);
-      const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}}); if(!res.ok) throw new Error(`API ${res.status}`);
-      const j=await res.json(); return j?.data?.[0] ?? null;
+    // NEW: Find nearest image ONLY within a bbox around the start point
+    async function findImageNearWithinMeters({lat, lng, meters=MAX_START_METERS, cap=50}){
+      const { dLat, dLng } = metersToDeg(lat, meters);
+      const bbox = [lng - dLng, lat - dLat, lng + dLng, lat + dLat]; // [minX,minY,maxX,maxY]
+
+      const url = new URL("https://graph.mapillary.com/images");
+      url.searchParams.set("fields", "id,computed_geometry");
+      url.searchParams.set("bbox", bbox.join(","));
+      url.searchParams.set("limit", String(cap));
+      if (defaults.username) url.searchParams.set("creator_username", defaults.username);
+
+      const res = await fetch(url, { headers: { Authorization: `OAuth ${TOKEN}` }});
+      if (!res.ok) throw new Error(`API ${res.status}`);
+      const j = await res.json();
+      const arr = Array.isArray(j?.data) ? j.data : [];
+
+      let best = null, bestD = Infinity;
+      for (const img of arr){
+        const c = img?.computed_geometry?.coordinates;
+        if (!c) continue;
+        const latlng = [c[1], c[0]];
+        const d = haversineMeters([lat, lng], latlng);
+        if (d < bestD){ best = { id: img.id, latlng, d }; bestD = d; }
+      }
+      return best; // null if none in range
     }
 
     async function getImageLatLng(imageId){
@@ -193,16 +231,12 @@
           const pin = L.circleMarker(latlng, defaultPinStyle)
             .on('click', (e)=>{
               L.DomEvent.stop(e);
-              // highlight immediately
-              selectPinById(img.id);
-              // and move viewer
-              if(viewer) gotoImage(img.id, latlng);
+              selectPinById(img.id);           // highlight immediately
+              if(viewer) gotoImage(img.id, latlng); // move viewer
             })
             .addTo(pinLayer);
 
-          // === HIGHLIGHT CHANGES ===
           pinsById.set(img.id, pin);
-          // === END HIGHLIGHT CHANGES ===
         }
         status(`Pins: ${images.length}`);
       }catch(e){ console.error(e); status("Error loading pins."); }
@@ -213,12 +247,11 @@
       if(!TOKEN){ status("Add ?token=..."); return; }
       try{
         status("Finding image near click…");
-        const img=await findImageNear({lat:e.latlng.lat, lng:e.latlng.lng});
-        if(img){
-          // === HIGHLIGHT CHANGES ===
-          selectPinById(img.id);
-          // === END HIGHLIGHT CHANGES ===
-          await gotoImage(img.id, [e.latlng.lat, e.latlng.lng]);
+        // Click continues to use 'find within bbox' (tight radius around click)
+        const startClick = await findImageNearWithinMeters({ lat:e.latlng.lat, lng:e.latlng.lng, meters: MAX_START_METERS });
+        if(startClick){
+          selectPinById(startClick.id);
+          await gotoImage(startClick.id, [e.latlng.lat, e.latlng.lng]);
           status("");
         }
         else status("No image found there.");
@@ -316,9 +349,7 @@
         suspendWatcher = true;
         await viewer.moveTo(id);
 
-        // === HIGHLIGHT CHANGES ===
         if (SHOW_PINS) selectPinById(id);
-        // === END HIGHLIGHT CHANGES ===
 
         if(latlngHint){
           marker.setLatLng([latlngHint[0], latlngHint[1]]);
@@ -340,8 +371,19 @@
       try{ viewer.setFieldOfView(FOV_DEG); }catch{}
 
       status("Searching for a nearby image…");
-      const start=await findImageNear({lat:defaults.lat, lng:defaults.lng});
-      if(!start){ status(`No imagery by "${defaults.username}" near start.`); return; }
+      const start = await findImageNearWithinMeters({
+        lat: defaults.lat,
+        lng: defaults.lng,
+        meters: MAX_START_METERS
+      });
+
+      if (!start){
+        status(`No imagery within ${MAX_START_METERS} m${defaults.username ? ` for "${defaults.username}"` : ""}. Staying at start.`);
+        // Keep map/marker at provided coords; load pins & wedge tracking
+        if (SHOW_PINS) drawPinsForView();
+        startCompassWatcher();
+        return;
+      }
 
       // On image change: move marker to that image, then reanchor so the angle sticks
       try {
@@ -353,26 +395,21 @@
             marker.setLatLng(latlng);
             if(FOLLOW_MAP && VIEW!=='image') map.setView(latlng, map.getZoom(), {animate:true});
           }
-
-          // === HIGHLIGHT CHANGES ===
           if (SHOW_PINS) selectPinById(id);
-          // === END HIGHLIGHT CHANGES ===
-
           await reanchorToSticky();
         });
       } catch {}
 
-      await gotoImage(start.id);
-      // initial marker + anchor
+      // Move to the start image that is actually within range
+      await gotoImage(start.id, start.latlng);
+
+      // initial marker + anchor (redundant safe-guard)
       const latlng0 = await getImageLatLng(start.id);
       if(latlng0){
         marker.setLatLng(latlng0);
         if(FOLLOW_MAP && VIEW!=='image') map.setView(latlng0, map.getZoom(), {animate:true});
       }
-
-      // === HIGHLIGHT CHANGES ===
       if (SHOW_PINS) selectPinById(start.id);
-      // === END HIGHLIGHT CHANGES ===
 
       await reanchorToSticky();         // anchor to START_BEARING (default 0°)
       status("");
