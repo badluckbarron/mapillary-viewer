@@ -42,7 +42,8 @@
   <script>
     // ------------------ Query/options ------------------
     const qs = new URLSearchParams(location.search);
-    const TOKEN = "MLY%7C24462366120070331%7C7b445698e786aaa212354b607653e542";
+    const RAW_TOKEN = "MLY%7C24462366120070331%7C7b445698e786aaa212354b607653e542";
+    const TOKEN = decodeURIComponent(RAW_TOKEN);
     const defaults = {
       lat: Number(30.138307),
       lng: Number(-91.965153),
