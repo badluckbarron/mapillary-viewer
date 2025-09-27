@@ -55,7 +55,7 @@
     const DEBUG         = qs.get("debug") === "1";
     const MAX_PINS      = Number(2000);
     // Default the wedge/bearing to WEST (270°) so it matches west-facing imagery
-    const START_BEARING = ((Number(qs.get("bearing")) || 0) + 360) % 360;
+    const START_BEARING = ((Number(qs.get("bearing")) || 270) + 360) % 360;
     const FOLLOW_MAP    = (qs.get("follow") ?? "1") !== "0";
 
     // +1 => wedge follows north arrow; -1 => wedge follows camera yaw
