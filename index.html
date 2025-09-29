@@ -2,313 +2,216 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Mapillary Split (Viewer + Map) – tiled bbox + sticky wedge</title>
+  <title>Mapillary viewer + map (split)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.css" />
   <script src="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.min.js"></script>
 
-  <!-- Leaflet -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- MapLibre GL (API-compatible with mapbox-gl) -->
+  <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
 
   <style>
     html, body { height: 100%; margin: 0; }
-    #wrap { height: 100vh; width: 100%; display: grid; grid-template-columns: 1fr 1fr; }
-    #mly, #map { height: 100%; width: 100%; }
-    #msg { position: absolute; top: 8px; left: 8px; z-index: 1000;
-           background: rgba(0,0,0,.6); color: #fff; padding: 6px 10px; border-radius: 6px;
-           font: 13px/1.4 system-ui, sans-serif; }
+    #app { position: relative; height: 100vh; width: 100%; }
   </style>
 </head>
 <body>
-  <div id="wrap">
-    <div id="mly" aria-label="Mapillary viewer"></div>
-    <div id="map" aria-label="Map"></div>
-    <div id="msg"></div>
-  </div>
+  <div id="app"></div>
 
   <script>
-    // ====== CONFIG ======
-    const TOKEN       = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
-    const START_ID    = "744575191439794";
-    const USERNAME    = "HKocen";
+    // --- Config: your Mapillary token + start image ---
+    const MLY_ACCESS_TOKEN = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
+    const START_IMAGE_ID   = "744575191439794";
 
-    // Mapillary Graph bbox hard limit is < 0.001 deg^2; stay below with a margin.
-    const MAX_TILE_AREA_DEG2 = 0.0008;
-    const MAX_TILES          = 64;     // safety to avoid excessive requests
-    const PER_TILE_LIMIT     = 200;    // results per tile request
-    const MIN_ZOOM_FOR_PINS  = 16;     // don't fetch pins until zoomed-in
+    // Optional: rough starting center (helps map init before the first image event)
+    const START_CENTER = { lng: -91.965153, lat: 30.138307 }; // Lafayette, LA approx
 
-    // Sticky wedge settings
-    const FOV_DEG       = 60;         // wedge/field-of-view angle
-    const ROT_SIGN      = -1;         // -1 => wedge follows camera yaw direction
-    const START_BEARING = 270;        // initialize wedge facing west
+    // Make MapLibre available under "mapboxgl" so we can reuse the same code patterns
+    window.mapboxgl = window.maplibregl;
 
-    // ====== Utilities ======
-    const status = (t) => { document.getElementById('msg').textContent = t || ""; };
-    const sleep  = (ms) => new Promise(r => setTimeout(r, ms));
-    const nextFrame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+    // ===== Helpers to create split containers (viewer left, map right) =====
+    function makeContainers(container) {
+      const boundingRect = container.getBoundingClientRect();
+      const height = `calc(100vh - ${boundingRect.top}px)`;
 
-    function clampLon(x){ return Math.max(-180, Math.min(180, x)); }
-    function clampLat(y){ return Math.max(-85,  Math.min(85,  y)); }
+      const viewerContainer = document.createElement('div');
+      viewerContainer.style.position = 'absolute';
+      viewerContainer.style.height = height;
+      viewerContainer.style.width = '61.8%';
 
-    // ====== Map (Leaflet) ======
-    const map = L.map('map', { zoomControl: true }).setView([30.138307, -91.965153], 15);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19, attribution: '&copy; OpenStreetMap'
-    }).addTo(map);
+      const mapContainer = document.createElement('div');
+      mapContainer.style.position = 'absolute';
+      mapContainer.style.right = '0px';
+      mapContainer.style.height = height;
+      mapContainer.style.width = 'calc(38.2% - 2px)';
+      mapContainer.style.marginLeft = '2px';
 
-    const pinLayer = L.layerGroup().addTo(map);
-    const orientationLayer = L.layerGroup().addTo(map);
-    const cursor = L.circleMarker([0,0], { radius: 8, weight: 3 }).addTo(map);
+      container.appendChild(viewerContainer);
+      container.appendChild(mapContainer);
 
-    const defaultPinStyle  = { radius: 4, color: '#1b5e20', weight: 2, fillColor: '#2ecc71', fillOpacity: 0.9 };
-    const selectedPinStyle = { radius: 8, color: '#e53935', weight: 3, fillColor: '#ffcdd2', fillOpacity: 1.0 };
-    let pinsById = new Map();
-    let selectedPin = null;
-
-    function bboxFromMap(m){
-      const b = m.getBounds();
-      let w = clampLon(b.getWest());
-      let s = clampLat(b.getSouth());
-      let e = clampLon(b.getEast());
-      let n = clampLat(b.getNorth());
-      const eps = 1e-9;
-      if (e <= w) e = w + eps;
-      if (n <= s) n = s + eps;
-      return [w, s, e, n];
-    }
-    function bboxAreaDeg2([w,s,e,n]) { return Math.max(0, e - w) * Math.max(0, n - s); }
-    function splitBbox([w,s,e,n]) {
-      const midX = (w + e) / 2, midY = (s + n) / 2;
-      return [
-        [w,    s,    midX, midY],
-        [midX, s,    e,    midY],
-        [w,    midY, midX, n   ],
-        [midX, midY, e,    n   ]
-      ];
-    }
-    function tileBboxes(bbox, maxArea = MAX_TILE_AREA_DEG2, maxTiles = MAX_TILES) {
-      const out = [];
-      const q = [bbox];
-      while (q.length && out.length < maxTiles) {
-        const b = q.shift();
-        if (bboxAreaDeg2(b) < maxArea) { out.push(b); continue; }
-        const parts = splitBbox(b);
-        if (parts.some(p => bboxAreaDeg2(p) === 0)) { out.push(b); continue; }
-        q.push(...parts);
-      }
-      return out;
+      return { viewer: viewerContainer, map: mapContainer };
     }
 
-    function destPoint(lat,lng,bearingDeg,meters){
-      const R=6371000, br=bearingDeg*Math.PI/180;
-      const φ1=lat*Math.PI/180, λ1=lng*Math.PI/180, δ=meters/R;
-      const φ2=Math.asin(Math.sin(φ1)*Math.cos(δ)+Math.cos(φ1)*Math.sin(δ)*Math.cos(br));
-      const λ2=λ1+Math.atan2(Math.sin(br)*Math.sin(δ)*Math.cos(φ1), Math.cos(δ)-Math.sin(φ1)*Math.sin(φ2));
-      return [φ2*180/Math.PI, ((λ2*180/Math.PI+540)%360)-180];
-    }
-    function drawOrientation(lat,lng,bearingDeg,fovDeg=FOV_DEG,length=50){
-      orientationLayer.clearLayers();
-      if(typeof bearingDeg!=='number') return;
-      const left=bearingDeg-fovDeg/2, right=bearingDeg+fovDeg/2;
-      const tip=destPoint(lat,lng,bearingDeg,length);
-      const pLeft=destPoint(lat,lng,left,length);
-      const pRight=destPoint(lat,lng,right,length);
-      L.polygon([[lat,lng],pLeft,pRight],{color:'#1976d2',weight:1,fillColor:'#1976d2',fillOpacity:.18}).addTo(orientationLayer);
-      L.polyline([[lat,lng],tip],{color:'#1976d2',weight:2,opacity:.9}).addTo(orientationLayer);
+    function makeMapboxMarker(options) {
+      const size = `${2 * options.radius}px`;
+      const circle = document.createElement('div');
+      circle.style.border = `3px solid ${options.color}`;
+      circle.style.backgroundColor = 'rgba(255, 255, 255, 0.6)';
+      circle.style.height = size;
+      circle.style.borderRadius = '50%';
+      circle.style.width = size;
+      return new mapboxgl.Marker({ element: circle, rotationAlignment: 'map' });
     }
 
-    // ====== Mapillary Viewer ======
-    const viewer = new mapillary.Viewer({
-      container: "mly",
-      accessToken: TOKEN,
-      imageId: START_ID,
-      component: { cover: true, direction: true, zoom: true, attribution: true }
-    });
+    const RAD2DEG = 180 / Math.PI;
+    const DEG2RAD = Math.PI / 180;
+    const rotateArc = (bearing) => `rotateZ(${bearing}deg)`;
 
-    // ====== Graph helpers (use access_token query + usernames) ======
-    async function getImageLatLng(imageId) {
-      const u = new URL(`https://graph.mapillary.com/${encodeURIComponent(imageId)}`);
-      u.searchParams.set("fields", "computed_geometry");
-      u.searchParams.set("access_token", TOKEN);
-      const res = await fetch(u);
-      if (!res.ok) return null;
-      const j = await res.json();
-      const c = j?.computed_geometry?.coordinates;
-      return (Array.isArray(c) && c.length === 2) ? [c[1], c[0]] : null;
+    function makeArc(fovDeg) {
+      const radius = 45, centerX = 50, centerY = 50;
+      const fovRad = DEG2RAD * fovDeg;
+      const arcStart = -Math.PI / 2 - fovRad / 2;
+      const arcEnd   = arcStart + fovRad;
+
+      const startX = centerX + radius * Math.cos(arcStart);
+      const startY = centerY + radius * Math.sin(arcStart);
+      const endX   = centerX + radius * Math.cos(arcEnd);
+      const endY   = centerY + radius * Math.sin(arcEnd);
+
+      const center = `M ${centerX} ${centerY}`;
+      const line   = `L ${startX} ${startY}`;
+      const arc    = `A ${radius} ${radius} 0 0 1 ${endX} ${endY}`;
+      return `${center} ${line} ${arc} Z`;
     }
 
-    async function fetchImagesForTile(bbox, limit = PER_TILE_LIMIT) {
-      // Clean, comma-joined bbox: west,south,east,north
-      const bboxStr = bbox.map(v => v.toFixed(7)).join(',');
-      const params = [
-        "fields=id,computed_geometry",
-        `bbox=${bboxStr}`,
-        `limit=${encodeURIComponent(String(limit))}`,
-        `usernames=${encodeURIComponent(USERNAME)}`,
-        `access_token=${encodeURIComponent(TOKEN)}`,
-      ].join("&");
-      const url = `https://graph.mapillary.com/images?${params}`;
+    function makeCamera(bearingDeg, fovDeg) {
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', makeArc(fovDeg));
+      path.setAttribute('fill', 'yellow');
+      path.setAttribute('fill-opacity', '0.5');
+      path.setAttribute('stroke', 'black');
+      path.setAttribute('stroke-width', '1');
+      path.setAttribute('stroke-linejoin', 'round');
 
-      const res = await fetch(url);
-      if (!res.ok) {
-        const t = await res.text().catch(() => res.statusText);
-        throw new Error(`API ${res.status}: ${t}`);
-      }
-      const j = await res.json();
-      return Array.isArray(j.data) ? j.data : [];
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('viewBox', '0 0 100 100');
+      svg.appendChild(path);
+      svg.style.height = '100%';
+      svg.style.width  = '100%';
+      svg.style.transform = rotateArc(bearingDeg);
+
+      const container = document.createElement('div');
+      container.style.height = '200px';
+      container.style.width  = '200px';
+      container.appendChild(svg);
+      return container;
     }
 
-    // ====== Pins drawing (tiled, zoom-guarded) ======
-    async function drawPinsForView() {
-      if (map.getZoom() < MIN_ZOOM_FOR_PINS) {
-        status(`Zoom in (≥ ${MIN_ZOOM_FOR_PINS}) to load pins`);
-        pinLayer.clearLayers(); pinsById.clear(); selectedPin = null;
+    // ===== App =====
+    let viewer, map;
+
+    async function init() {
+      const app = document.getElementById('app');
+      const containers = makeContainers(app);
+
+      // Mapillary viewer
+      const ViewerCtor = (window.mapillary && window.mapillary.Viewer) || window.Viewer;
+      if (!ViewerCtor) {
+        console.error("MapillaryJS failed to load.");
         return;
       }
+      viewer = new ViewerCtor({
+        accessToken: MLY_ACCESS_TOKEN,
+        component: { cover: false },
+        container: containers.viewer,
+      });
 
-      const viewBox = bboxFromMap(map);
-      const tiles = tileBboxes(viewBox, MAX_TILE_AREA_DEG2, MAX_TILES);
-      status(`Loading pins… (${tiles.length} tile${tiles.length>1?'s':''})`);
+      // Move to your start image
+      viewer.moveTo(START_IMAGE_ID).catch(err => console.warn(err));
 
-      const seen = new Set();
-      const features = [];
+      // Map (MapLibre GL) — no token required with the demo style
+      map = new mapboxgl.Map({
+        container: containers.map,
+        style: 'https://demotiles.maplibre.org/style.json',
+        center: [START_CENTER.lng, START_CENTER.lat],
+        zoom: 18,
+        pitch: 45,
+      });
 
-      for (const t of tiles) {
-        try {
-          const images = await fetchImagesForTile(t, PER_TILE_LIMIT);
-          for (const img of images) {
-            const c = img?.computed_geometry?.coordinates;
-            if (!c) continue;
-            if (seen.has(img.id)) continue;
-            seen.add(img.id);
-            features.push({ id: img.id, lat: c[1], lng: c[0] });
-          }
-        } catch (err) {
-          console.warn("Tile fetch failed:", err.message);
-        }
-      }
+      // Camera wedge + markers
+      const camera = makeCamera(0, 90);
+      const cameraMarker = new mapboxgl.Marker({ element: camera, rotationAlignment: 'map' });
 
-      pinLayer.clearLayers(); pinsById.clear(); selectedPin = null;
-      for (const f of features) {
-        const pin = L.circleMarker([f.lat, f.lng], defaultPinStyle)
-          .on('click', () => viewer.moveTo(f.id))
-          .addTo(pinLayer);
-        pin.bindTooltip(`Image ${f.id}`);
-        pinsById.set(f.id, pin);
-      }
-      status(`Pins: ${features.length}`);
-    }
+      const originalMarker = makeMapboxMarker({ radius: 14, color: '#f00' });
+      const lngLatMarker   = makeMapboxMarker({ radius: 14, color: '#00f' });
+      const positionMarker = makeMapboxMarker({ radius: 10, color: '#f0f' });
 
-    // Debounce fetch on map move
-    let pinTimer = null;
-    map.on('moveend', () => {
-      clearTimeout(pinTimer);
-      pinTimer = setTimeout(drawPinsForView, 250);
-    });
+      const onImage = (image) => {
+        // image.lngLat and image.originalLngLat are provided by MapillaryJS
+        const lngLat = [image.lngLat.lng, image.lngLat.lat];
+        lngLatMarker.setLngLat(lngLat);
+        if (!map.getBounds().contains(lngLat)) map.setCenter(lngLat);
 
-    // ====== Sticky wedge: read viewer rotation from DOM, maintain wedge ======
-    function getRotationDeg(rootEl){
-      if(!rootEl) return null;
-      const tryParse = (tr) => {
-        if (!tr || tr === 'none') return null;
-        const r = /rotate(?:Z)?\(\s*([-+0-9.]+)\s*(deg|rad)\s*\)/i.exec(tr);
-        if (r) return r[2].toLowerCase()==='rad' ? (parseFloat(r[1])*180/Math.PI) : parseFloat(r[1]);
-        const m2 = /^matrix\(\s*([-+0-9eE.,\s]+)\)$/.exec(tr);
-        if (m2){ const [a,b] = m2[1].split(',').map(Number); return Math.atan2(b,a)*180/Math.PI; }
-        const m3 = /^matrix3d\(\s*([-+0-9eE.,\s]+)\)$/.exec(tr);
-        if (m3){ const p = m3[1].split(',').map(Number); return Math.atan2(p[1],p[0])*180/Math.PI; }
-        return null;
+        const originalPos = [image.originalLngLat.lng, image.originalLngLat.lat];
+        originalMarker.setLngLat(originalPos);
       };
-      const stack=[rootEl], maxDepth=3;
-      for (let d=0; d<=maxDepth; d++){
-        const next=[];
-        for (const el of stack){
-          const deg = tryParse(getComputedStyle(el).transform || el.style?.transform || '');
-          if (deg!=null) return (deg % 360 + 360) % 360;
-          for (const ch of el.children || []) next.push(ch);
-        }
-        stack.splice(0, stack.length, ...next);
-      }
-      return null;
+
+      const onFov = async () => {
+        const viewerContainer = viewer.getContainer();
+        const height = viewerContainer.offsetHeight;
+        const width  = viewerContainer.offsetWidth;
+        const aspect = height === 0 ? 0 : width / height;
+
+        const verticalFov  = DEG2RAD * (await viewer.getFieldOfView());
+        const horizontalFov = RAD2DEG * Math.atan(aspect * Math.tan(0.5 * verticalFov)) * 2;
+
+        const path = camera.querySelector('path');
+        path.setAttribute('d', makeArc(horizontalFov));
+      };
+
+      const onPov = async () => {
+        const pov = await viewer.getPointOfView();
+        const svg = camera.querySelector('svg');
+        svg.style.transform = rotateArc(pov.bearing);
+      };
+
+      const onPosition = async () => {
+        const position = await viewer.getPosition();
+        const pos = [position.lng, position.lat];
+        positionMarker.setLngLat(pos);
+        cameraMarker.setLngLat(pos);
+      };
+
+      viewer.on('load', async () => {
+        const image = await viewer.getImage();
+        onImage(image);
+
+        await onFov();
+        await onPov();
+        await onPosition();
+
+        lngLatMarker.addTo(map);
+        originalMarker.addTo(map);
+        positionMarker.addTo(map);
+        cameraMarker.addTo(map);
+      });
+
+      viewer.on('image', (event) => onImage(event.image));
+      viewer.on('position', onPosition);
+      viewer.on('fov', onFov);
+      window.addEventListener('resize', onFov);
+      viewer.on('pov', onPov);
     }
-    function getCompassRotation(){
-      const host=document.getElementById('mly');
-      const trySel=(sel)=>{ const el=host?.querySelector(sel); const deg=getRotationDeg(el); return deg!=null?deg:null; };
-      return (
-        trySel('.mapillary-bearing-indicator-background') ??
-        trySel('.mapillary-bearing-indicator-background-arrow') ??
-        trySel('.mapillary-bearing-north-container') ??
-        trySel('[class*="bearing"]') ??
-        null
-      );
-    }
 
-    let compassOffset = 0;     // wedgeBearing = (compassOffset + ROT_SIGN*rot) % 360
-    let stickyBearing = START_BEARING;
-    let suspendWatcher = false;
+    init();
 
-    async function reanchorToSticky(){
-      suspendWatcher = true;
-      await nextFrame(); // ensure viewer DOM updated
-      const rot = getCompassRotation();
-      if (rot != null) {
-        compassOffset = ((stickyBearing - ROT_SIGN * rot) % 360 + 360) % 360;
-        const p = cursor.getLatLng();
-        drawOrientation(p.lat, p.lng, stickyBearing, FOV_DEG, 50);
-      }
-      suspendWatcher = false;
-    }
-
-    // live wedge updater
-    setInterval(() => {
-      if (suspendWatcher) return;
-      const rot = getCompassRotation();
-      if (rot == null) return;
-      const bearing = (compassOffset + ROT_SIGN * rot) % 360;
-      stickyBearing = (bearing + 360) % 360;
-      const p = cursor.getLatLng();
-      drawOrientation(p.lat, p.lng, stickyBearing, FOV_DEG, 50);
-    }, 120);
-
-    // ====== Viewer -> Map sync & selection ======
-    viewer.on("image", async e => {
-      const id = e?.imageId || e?.image?.id;
-      if (!id) return;
-      try {
-        const ll = await getImageLatLng(id);
-        if (ll) {
-          cursor.setLatLng(ll);
-          if (!map.getBounds().pad(-0.2).contains(ll)) {
-            map.setView(ll, Math.max(map.getZoom(), 16));
-          }
-        }
-      } catch {}
-      // highlight pin if present
-      const lyr = pinsById.get(id);
-      if (lyr) {
-        if (selectedPin && selectedPin !== lyr) { try { selectedPin.setStyle(defaultPinStyle); } catch {} }
-        try { lyr.setStyle(selectedPinStyle); lyr.bringToFront(); } catch {}
-        selectedPin = lyr;
-      }
-      // keep wedge anchored
-      reanchorToSticky();
-    });
-
-    // ====== Boot ======
-    (async () => {
-      try {
-        const ll = await getImageLatLng(START_ID);
-        if (ll) {
-          cursor.setLatLng(ll);
-          map.setView(ll, Math.max(map.getZoom(), 16));
-        }
-      } catch {}
-      drawPinsForView(); // first load (will no-op if zoom < MIN_ZOOM_FOR_PINS)
-    })();
+    // If you want to use Mapbox GL instead of MapLibre:
+    // 1) Replace the two MapLibre <script>/<link> tags with Mapbox GL CDN.
+    // 2) Add your Mapbox token and set: mapboxgl.accessToken = "YOUR_MAPBOX_TOKEN";
+    // 3) Change the style to a Mapbox style URL, e.g. 'mapbox://styles/mapbox/streets-v11'.
   </script>
 </body>
 </html>
