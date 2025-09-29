@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>MapillaryJS – split viewer/map w/ safe bbox tiling</title>
+  <title>Mapillary Split (Viewer + Map) – tiled bbox + sticky wedge</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -15,7 +15,7 @@
 
   <style>
     html, body { height: 100%; margin: 0; }
-    #wrap { height: 100vh; width: 100%; display:grid; grid-template-columns:1fr 1fr; }
+    #wrap { height: 100vh; width: 100%; display: grid; grid-template-columns: 1fr 1fr; }
     #mly, #map { height: 100%; width: 100%; }
     #msg { position: absolute; top: 8px; left: 8px; z-index: 1000;
            background: rgba(0,0,0,.6); color: #fff; padding: 6px 10px; border-radius: 6px;
@@ -31,27 +31,97 @@
 
   <script>
     // ====== CONFIG ======
-    const TOKEN      = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
-    const START_ID   = "744575191439794";
-    const USERNAME   = "HKocen";
+    const TOKEN       = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
+    const START_ID    = "744575191439794";
+    const USERNAME    = "HKocen";
 
-    // Mapillary Graph limits: < 0.001 deg^2 (strict). Use a safety margin.
-    const MAX_TILE_AREA = 0.0008;                  // deg^2
-    const MIN_ZOOM_FOR_PINS = 16;                  // require zoom-in before fetching
-    const PER_TILE_LIMIT = 200;                    // keep it reasonable
+    // Mapillary Graph bbox hard limit is < 0.001 deg^2; stay below with a margin.
+    const MAX_TILE_AREA_DEG2 = 0.0008;
+    const MAX_TILES          = 64;     // safety to avoid excessive requests
+    const PER_TILE_LIMIT     = 200;    // results per tile request
+    const MIN_ZOOM_FOR_PINS  = 16;     // don't fetch pins until zoomed-in
 
-    // ====== UI helpers ======
-    const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
+    // Sticky wedge settings
+    const FOV_DEG      = 60;          // wedge/field-of-view angle
+    const ROT_SIGN     = -1;          // -1 => wedge follows camera yaw direction
+    const START_BEARING = 270;        // initialize wedge facing west
 
-    // ====== MAP ======
-    const map = L.map('map', { zoomControl:true }).setView([30.138307, -91.965153], 15);
+    // ====== Utilities ======
+    const status = (t) => { document.getElementById('msg').textContent = t || ""; };
+    const sleep  = (ms) => new Promise(r => setTimeout(r, ms));
+    const nextFrame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    function clampLon(x){ return Math.max(-180, Math.min(180, x)); }
+    function clampLat(y){ return Math.max(-85,  Math.min(85,  y)); }
+
+    // ====== Map (Leaflet) ======
+    const map = L.map('map', { zoomControl: true }).setView([30.138307, -91.965153], 15);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19, attribution: '&copy; OpenStreetMap'
     }).addTo(map);
+
     const pinLayer = L.layerGroup().addTo(map);
+    const orientationLayer = L.layerGroup().addTo(map);
     const cursor = L.circleMarker([0,0], { radius: 8, weight: 3 }).addTo(map);
 
-    // ====== VIEWER ======
+    const defaultPinStyle  = { radius: 4, color: '#1b5e20', weight: 2, fillColor: '#2ecc71', fillOpacity: 0.9 };
+    const selectedPinStyle = { radius: 8, color: '#e53935', weight: 3, fillColor: '#ffcdd2', fillOpacity: 1.0 };
+    let pinsById = new Map();
+    let selectedPin = null;
+
+    function bboxFromMap(m){
+      const b = m.getBounds();
+      let w = clampLon(b.getWest());
+      let s = clampLat(b.getSouth());
+      let e = clampLon(b.getEast());
+      let n = clampLat(b.getNorth());
+      const eps = 1e-9;
+      if (e <= w) e = w + eps;
+      if (n <= s) n = s + eps;
+      return [w, s, e, n];
+    }
+    function bboxAreaDeg2([w,s,e,n]) { return Math.max(0, e - w) * Math.max(0, n - s); }
+    function splitBbox([w,s,e,n]) {
+      const midX = (w + e) / 2, midY = (s + n) / 2;
+      return [
+        [w,    s,    midX, midY],
+        [midX, s,    e,    midY],
+        [w,    midY, midX, n   ],
+        [midX, midY, e,    n   ]
+      ];
+    }
+    function tileBboxes(bbox, maxArea = MAX_TILE_AREA_DEG2, maxTiles = MAX_TILES) {
+      const out = [];
+      const q = [bbox];
+      while (q.length && out.length < maxTiles) {
+        const b = q.shift();
+        if (bboxAreaDeg2(b) < maxArea) { out.push(b); continue; }
+        const parts = splitBbox(b);
+        if (parts.some(p => bboxAreaDeg2(p) === 0)) { out.push(b); continue; }
+        q.push(...parts);
+      }
+      return out;
+    }
+
+    function destPoint(lat,lng,bearingDeg,meters){
+      const R=6371000, br=bearingDeg*Math.PI/180;
+      const φ1=lat*Math.PI/180, λ1=lng*Math.PI/180, δ=meters/R;
+      const φ2=Math.asin(Math.sin(φ1)*Math.cos(δ)+Math.cos(φ1)*Math.sin(δ)*Math.cos(br));
+      const λ2=λ1+Math.atan2(Math.sin(br)*Math.sin(δ)*Math.cos(φ1), Math.cos(δ)-Math.sin(φ1)*Math.sin(φ2));
+      return [φ2*180/Math.PI, ((λ2*180/Math.PI+540)%360)-180];
+    }
+    function drawOrientation(lat,lng,bearingDeg,fovDeg=FOV_DEG,length=50){
+      orientationLayer.clearLayers();
+      if(typeof bearingDeg!=='number') return;
+      const left=bearingDeg-fovDeg/2, right=bearingDeg+fovDeg/2;
+      const tip=destPoint(lat,lng,bearingDeg,length);
+      const pLeft=destPoint(lat,lng,left,length);
+      const pRight=destPoint(lat,lng,right,length);
+      L.polygon([[lat,lng],pLeft,pRight],{color:'#1976d2',weight:1,fillColor:'#1976d2',fillOpacity:.18}).addTo(orientationLayer);
+      L.polyline([[lat,lng],tip],{color:'#1976d2',weight:2,opacity:.9}).addTo(orientationLayer);
+    }
+
+    // ====== Mapillary Viewer ======
     const viewer = new mapillary.Viewer({
       container: "mly",
       accessToken: TOKEN,
@@ -59,29 +129,9 @@
       component: { cover: true, direction: true, zoom: true, attribution: true }
     });
 
-    // Keep map centered on the active image
-    viewer.on("image", async e => {
-      const id = e?.imageId || e?.image?.id;
-      if (!id) return;
-      const ll = await getImageLatLng(id);
-      if (ll) {
-        cursor.setLatLng(ll);
-        if (!map.getBounds().pad(-0.2).contains(ll)) {
-          map.setView(ll, Math.max(map.getZoom(), 16));
-        }
-      }
-      // highlight pin if present
-      const lyr = pinsById.get(id);
-      if (lyr) {
-        if (selectedPin && selectedPin !== lyr) try { selectedPin.setStyle(defaultPinStyle); } catch {}
-        try { lyr.setStyle(selectedPinStyle); lyr.bringToFront(); } catch {}
-        selectedPin = lyr;
-      }
-    });
-
     // ====== Graph helpers ======
     async function getImageLatLng(imageId) {
-      const u = new URL(`https://graph.mapillary.com/${imageId}`);
+      const u = new URL(`https://graph.mapillary.com/${encodeURIComponent(imageId)}`);
       u.searchParams.set("fields", "computed_geometry");
       const res = await fetch(u, { headers: { Authorization: `OAuth ${TOKEN}` }});
       if (!res.ok) return null;
@@ -90,42 +140,16 @@
       return (Array.isArray(c) && c.length === 2) ? [c[1], c[0]] : null;
     }
 
-    // ====== BBOX tiling (to satisfy < 0.001 deg²) ======
-    function bboxFromMap(m) {
-      const b = m.getBounds();
-      const sw = b.getSouthWest(), ne = b.getNorthEast();
-      return [sw.lng, sw.lat, ne.lng, ne.lat];      // [w,s,e,n]
-    }
-    function bboxAreaDeg2([w,s,e,n]) { return Math.max(0, (e-w)) * Math.max(0, (n-s)); }
-    function splitBbox([w,s,e,n]) {
-      const midX = (w+e)/2, midY = (s+n)/2;
-      return [
-        [w,    s,    midX, midY],   // SW
-        [midX, s,    e,    midY],   // SE
-        [w,    midY, midX, n   ],   // NW
-        [midX, midY, e,    n   ]    // NE
-      ];
-    }
-    function tileBboxes(bbox, maxArea = MAX_TILE_AREA, maxTiles = 64) {
-      const out = [];
-      const q = [bbox];
-      while (q.length && out.length < maxTiles) {
-        const b = q.shift();
-        if (bboxAreaDeg2(b) < maxArea) { out.push(b); continue; }
-        const parts = splitBbox(b);
-        // If splitting doesn’t reduce (degenerate bounds), stop
-        if (parts.some(p => bboxAreaDeg2(p) === 0)) { out.push(b); continue; }
-        q.push(...parts);
-      }
-      return out;
-    }
-
     async function fetchImagesForTile(bbox, limit = PER_TILE_LIMIT) {
-      const url = new URL("https://graph.mapillary.com/images");
-      url.searchParams.set("fields", "id,computed_geometry");
-      url.searchParams.set("bbox", bbox.join(","));
-      url.searchParams.set("limit", String(limit));
-      if (USERNAME) url.searchParams.set("creator_username", USERNAME);
+      const bboxStr = bbox.map(v => v.toFixed(6)).join(',');
+      const base = "https://graph.mapillary.com/images";
+      const qs = [
+        "fields=id,computed_geometry",
+        `bbox=${bboxStr}`,
+        `limit=${encodeURIComponent(String(limit))}`,
+        USERNAME ? `creator_username=${encodeURIComponent(USERNAME)}` : null,
+      ].filter(Boolean).join("&");
+      const url = `${base}?${qs}`;
 
       const res = await fetch(url, { headers: { Authorization: `OAuth ${TOKEN}` }});
       if (!res.ok) {
@@ -136,26 +160,19 @@
       return Array.isArray(j.data) ? j.data : [];
     }
 
-    // ====== Pins drawing with tiling + zoom guard ======
-    const defaultPinStyle  = { radius: 4, color: '#1b5e20', weight: 2, fillColor: '#2ecc71', fillOpacity: 0.9 };
-    const selectedPinStyle = { radius: 8, color: '#e53935', weight: 3, fillColor: '#ffcdd2', fillOpacity: 1.0 };
-    let pinsById = new Map();
-    let selectedPin = null;
-
+    // ====== Pins drawing (tiled, zoom-guarded) ======
     async function drawPinsForView() {
       if (map.getZoom() < MIN_ZOOM_FOR_PINS) {
         status(`Zoom in (≥ ${MIN_ZOOM_FOR_PINS}) to load pins`);
-        pinLayer.clearLayers();
-        pinsById.clear();
-        selectedPin = null;
+        pinLayer.clearLayers(); pinsById.clear(); selectedPin = null;
         return;
       }
 
       const viewBox = bboxFromMap(map);
-      const tiles = tileBboxes(viewBox, MAX_TILE_AREA);
+      const tiles = tileBboxes(viewBox, MAX_TILE_AREA_DEG2, MAX_TILES);
       status(`Loading pins… (${tiles.length} tile${tiles.length>1?'s':''})`);
 
-      const idSeen = new Set();
+      const seen = new Set();
       const features = [];
 
       for (const t of tiles) {
@@ -164,21 +181,17 @@
           for (const img of images) {
             const c = img?.computed_geometry?.coordinates;
             if (!c) continue;
-            if (idSeen.has(img.id)) continue;
-            idSeen.add(img.id);
+            if (seen.has(img.id)) continue;
+            seen.add(img.id);
             features.push({ id: img.id, lat: c[1], lng: c[0] });
           }
         } catch (err) {
+          // keep going even if one tile errors
           console.warn("Tile fetch failed:", err.message);
-          // keep going — other tiles may succeed
         }
       }
 
-      // Render pins
-      pinLayer.clearLayers();
-      pinsById.clear();
-      selectedPin = null;
-
+      pinLayer.clearLayers(); pinsById.clear(); selectedPin = null;
       for (const f of features) {
         const pin = L.circleMarker([f.lat, f.lng], defaultPinStyle)
           .on('click', () => viewer.moveTo(f.id))
@@ -189,16 +202,103 @@
       status(`Pins: ${features.length}`);
     }
 
-    // Debounced refresh on map move
+    // Debounce fetch on map move
     let pinTimer = null;
     map.on('moveend', () => {
       clearTimeout(pinTimer);
       pinTimer = setTimeout(drawPinsForView, 250);
     });
 
-    // First center + initial pins
+    // ====== Sticky wedge: read viewer rotation from DOM, maintain wedge ======
+    function getRotationDeg(rootEl){
+      if(!rootEl) return null;
+      const tryParse = (tr) => {
+        if (!tr || tr === 'none') return null;
+        const r = /rotate(?:Z)?\(\s*([-+0-9.]+)\s*(deg|rad)\s*\)/i.exec(tr);
+        if (r) return r[2].toLowerCase()==='rad' ? (parseFloat(r[1])*180/Math.PI) : parseFloat(r[1]);
+        const m2 = /^matrix\(\s*([-+0-9eE.,\s]+)\)$/.exec(tr);
+        if (m2){ const [a,b] = m2[1].split(',').map(Number); return Math.atan2(b,a)*180/Math.PI; }
+        const m3 = /^matrix3d\(\s*([-+0-9eE.,\s]+)\)$/.exec(tr);
+        if (m3){ const p = m3[1].split(',').map(Number); return Math.atan2(p[1],p[0])*180/Math.PI; }
+        return null;
+      };
+      const stack=[rootEl], maxDepth=3;
+      for (let d=0; d<=maxDepth; d++){
+        const next=[];
+        for (const el of stack){
+          const deg = tryParse(getComputedStyle(el).transform || el.style?.transform || '');
+          if (deg!=null) return (deg % 360 + 360) % 360;
+          for (const ch of el.children || []) next.push(ch);
+        }
+        stack.splice(0, stack.length, ...next);
+      }
+      return null;
+    }
+    function getCompassRotation(){
+      const host=document.getElementById('mly');
+      const trySel=(sel)=>{ const el=host?.querySelector(sel); const deg=getRotationDeg(el); return deg!=null?deg:null; };
+      return (
+        trySel('.mapillary-bearing-indicator-background') ??
+        trySel('.mapillary-bearing-indicator-background-arrow') ??
+        trySel('.mapillary-bearing-north-container') ??
+        trySel('[class*="bearing"]') ??
+        null
+      );
+    }
+
+    let compassOffset = 0;     // wedgeBearing = (compassOffset + ROT_SIGN*rot) % 360
+    let stickyBearing = START_BEARING;
+    let suspendWatcher = false;
+
+    async function reanchorToSticky(){
+      suspendWatcher = true;
+      await nextFrame(); // ensure viewer DOM updated
+      const rot = getCompassRotation();
+      if (rot != null) {
+        compassOffset = ((stickyBearing - ROT_SIGN * rot) % 360 + 360) % 360;
+        const p = cursor.getLatLng();
+        drawOrientation(p.lat, p.lng, stickyBearing, FOV_DEG, 50);
+      }
+      suspendWatcher = false;
+    }
+
+    // live wedge updater
+    setInterval(() => {
+      if (suspendWatcher) return;
+      const rot = getCompassRotation();
+      if (rot == null) return;
+      const bearing = (compassOffset + ROT_SIGN * rot) % 360;
+      stickyBearing = (bearing + 360) % 360;
+      const p = cursor.getLatLng();
+      drawOrientation(p.lat, p.lng, stickyBearing, FOV_DEG, 50);
+    }, 120);
+
+    // ====== Viewer -> Map sync & selection ======
+    viewer.on("image", async e => {
+      const id = e?.imageId || e?.image?.id;
+      if (!id) return;
+      try {
+        const ll = await getImageLatLng(id);
+        if (ll) {
+          cursor.setLatLng(ll);
+          if (!map.getBounds().pad(-0.2).contains(ll)) {
+            map.setView(ll, Math.max(map.getZoom(), 16));
+          }
+        }
+      } catch {}
+      // highlight pin if present
+      const lyr = pinsById.get(id);
+      if (lyr) {
+        if (selectedPin && selectedPin !== lyr) { try { selectedPin.setStyle(defaultPinStyle); } catch {} }
+        try { lyr.setStyle(selectedPinStyle); lyr.bringToFront(); } catch {}
+        selectedPin = lyr;
+      }
+      // keep wedge anchored
+      reanchorToSticky();
+    });
+
+    // ====== Boot ======
     (async () => {
-      // Center map on start image location (and cursor)
       try {
         const ll = await getImageLatLng(START_ID);
         if (ll) {
@@ -206,8 +306,7 @@
           map.setView(ll, Math.max(map.getZoom(), 16));
         }
       } catch {}
-      // Initial load
-      drawPinsForView();
+      drawPinsForView(); // first load (will no-op if zoom < MIN_ZOOM_FOR_PINS)
     })();
   </script>
 </body>
