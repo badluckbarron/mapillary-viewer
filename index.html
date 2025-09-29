@@ -43,7 +43,7 @@
     // ------------------ Query/options ------------------
     const qs = new URLSearchParams(location.search);
 
-    // RAW token may be URL-encoded (MLY%7C...); decode to MLY|...
+    // Decode token (avoid using %7C form with the API)
     const RAW_TOKEN = "MLY%7C24462366120070331%7C7b445698e786aaa212354b607653e542";
     const TOKEN = decodeURIComponent(RAW_TOKEN);
 
@@ -54,20 +54,15 @@
       username: "HKocen"
     };
 
-    const VIEW          = "split";                   // image | map | split
-    const SHOW_PINS     = true;                      // show pins
-    const FOV_DEG       = Number(60);                // visual field-of-view
+    const VIEW          = "split";                 // image | map | split
+    const SHOW_PINS     = true;
+    const FOV_DEG       = Number(60);
     const DEBUG         = qs.get("debug") === "1";
-    const MAX_PINS      = Number(1000);              // cap at 1000 to avoid API limit errors
-    // Start wedge/bearing WEST (270°) to match west-facing default imagery
-    const START_BEARING = ((Number(qs.get("bearing")) || 270) + 360) % 360;
+    const MAX_PINS      = Number(800);             // total cap across tiles
+    const START_BEARING = ((Number(qs.get("bearing")) || 270) + 360) % 360; // WEST
     const FOLLOW_MAP    = (qs.get("follow") ?? "1") !== "0";
-
-    // +1 => wedge follows north arrow; -1 => wedge follows camera yaw
-    const ROT_SIGN = (-1);
-
-    // Start on this image if provided/available:
     const START_IMAGE_ID = (qs.get("image") || "744575191439794").trim();
+    const ROT_SIGN = -1;
 
     const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
     const dbg    = (t)=>{ const el=document.getElementById('dbg'); if (DEBUG){ el.style.display='block'; el.textContent=t; } };
@@ -85,10 +80,9 @@
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
-    const startLatLng = [defaults.lat, defaults.lng];
 
-    // Slightly more zoomed out: 16 -> 14
-    const initialZoom = Math.max(0, (defaults.z || 16) - 2);
+    const startLatLng = [defaults.lat, defaults.lng];
+    const initialZoom = Math.max(0, (defaults.z || 16) - 2); // 16 -> 14 (a bit more zoomed out)
     map.setView(startLatLng, initialZoom);
 
     const marker = L.marker(startLatLng, { draggable:false }).addTo(map);
@@ -100,7 +94,7 @@
       fillColor: '#2ecc71', fillOpacity: 0.9, className: 'pin'
     };
 
-    // === Pin highlight helpers ===
+    // --- Pin highlight helpers ---
     const selectedPinStyle = {
       radius: 8, color: '#e53935', weight: 3, opacity: 1,
       fillColor: '#ffcdd2', fillOpacity: 1.0, className: 'pin-selected'
@@ -119,7 +113,11 @@
     }
 
     // ------------------ Helpers ------------------
-    function bboxFromMap(m){ const b=m.getBounds(), sw=b.getSouthWest(), ne=b.getNorthEast(); return [sw.lng, sw.lat, ne.lng, ne.lat]; }
+    function bboxFromMap(m){
+      const b=m.getBounds(), sw=b.getSouthWest(), ne=b.getNorthEast();
+      return [sw.lng, sw.lat, ne.lng, ne.lat]; // [minX,minY,maxX,maxY]
+    }
+    function bboxAreaDeg2(b){ return Math.max(0, (b[2]-b[0]) * (b[3]-b[1])); }
     function destPoint(lat,lng,bearingDeg,meters){
       const R=6371000, br=bearingDeg*Math.PI/180;
       const φ1=lat*Math.PI/180, λ1=lng*Math.PI/180, δ=meters/R;
@@ -138,7 +136,7 @@
       L.polyline([[lat,lng],tip],{color:'#1976d2',weight:2,opacity:.9}).addTo(orientationLayer);
     }
 
-    // ------------------ Graph API (pins + image coords) ------------------
+    // ------------------ Graph API helpers ------------------
     async function findImageNear({lat,lng}){
       const url=new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields","id,computed_geometry");
@@ -147,13 +145,9 @@
       url.searchParams.set("limit","1");
       if(defaults.username) url.searchParams.set("creator_username", defaults.username);
       const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}}); 
-      if(!res.ok){ 
-        const t = await res.text().catch(()=>res.statusText);
-        throw new Error(`API ${res.status} ${t}`);
-      }
+      if(!res.ok){ const t=await res.text().catch(()=>res.statusText); throw new Error(`API ${res.status} ${t}`); }
       const j=await res.json(); return j?.data?.[0] ?? null;
     }
-
     async function getImageLatLng(imageId){
       const u=new URL(`https://graph.mapillary.com/${imageId}`);
       u.searchParams.set("fields","computed_geometry");
@@ -164,37 +158,120 @@
       return Array.isArray(c) && c.length===2 ? [c[1], c[0]] : null;
     }
 
-    async function fetchImagesInBbox({bbox, cap=MAX_PINS}){
-      // Keep page size at or under 1000 to avoid 400s.
-      const PAGE = Math.min(1000, cap);
-      let out = [];
-      let url = new URL("https://graph.mapillary.com/images");
+    // ---- BBOX tiling with sanitization ----
+    const MAX_BBOX_AREA = 0.001;    // per API error
+    const PER_CALL_LIMIT = 250;      // reasonable page size
+    const MIN_SPAN = 1e-5;           // ~1m in deg (ensure non-zero width/height)
+
+    function sanitizeBbox(b){
+      if(!b || b.length!==4) return null;
+      let [x1,y1,x2,y2] = b.map(n => Number(n));
+      if(!Number.isFinite(x1)||!Number.isFinite(y1)||!Number.isFinite(x2)||!Number.isFinite(y2)) return null;
+      // sort mins/maxes
+      if(x1 > x2) [x1,x2] = [x2,x1];
+      if(y1 > y2) [y1,y2] = [y2,y1];
+      // clamp to valid ranges
+      x1 = Math.max(-180, Math.min(180, x1));
+      x2 = Math.max(-180, Math.min(180, x2));
+      y1 = Math.max(-90,  Math.min(90,  y1));
+      y2 = Math.max(-90,  Math.min(90,  y2));
+      // ensure minimal span
+      if (x2 - x1 < MIN_SPAN) { const cx=(x1+x2)/2; x1=cx-MIN_SPAN/2; x2=cx+MIN_SPAN/2; }
+      if (y2 - y1 < MIN_SPAN) { const cy=(y1+y2)/2; y1=cy-MIN_SPAN/2; y2=cy+MIN_SPAN/2; }
+      // round to 6 decimals to avoid weird parser issues
+      return [x1,y1,x2,y2].map(v => Number(v.toFixed(6)));
+    }
+
+    async function fetchBoxOnce(bbox, limit){
+      const bb = sanitizeBbox(bbox);
+      if(!bb) throw new Error("Bad bbox");
+      const url=new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields","id,computed_geometry");
-      url.searchParams.set("bbox", bbox.join(","));
-      url.searchParams.set("limit", String(Math.min(PAGE, cap)));
+      url.searchParams.set("bbox", bb.join(","));
+      url.searchParams.set("limit", String(limit));
       if(defaults.username) url.searchParams.set("creator_username", defaults.username);
 
-      while(url && out.length < cap){
-        const res = await fetch(url, { headers:{ Authorization:`OAuth ${TOKEN}` }});
-        if(!res.ok){
-          const t = await res.text().catch(()=>res.statusText);
-          throw new Error(`API ${res.status} ${t}`);
-        }
-        const j = await res.json();
-        if(Array.isArray(j.data)) out.push(...j.data);
-        const next = j?.paging?.next;
-        if(!next || out.length >= cap) break;
-        url = new URL(next);
-        url.searchParams.set("limit", String(Math.min(PAGE, cap - out.length)));
+      const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}}); 
+      if(!res.ok){
+        const t = await res.text().catch(()=>res.statusText);
+        throw new Error(`API ${res.status} ${t}`);
       }
-      return out.slice(0, cap);
+      const j=await res.json();
+      return { data: Array.isArray(j.data) ? j.data : [], next: j?.paging?.next || null };
+    }
+
+    async function fetchImagesInBboxTiled({bbox, cap=MAX_PINS}){
+      const out = [];
+      const seen = new Set();
+
+      async function crawl(b){
+        if(out.length >= cap) return;
+        const bb = sanitizeBbox(b);
+        if(!bb) return; // skip invalid tile
+
+        const area = bboxAreaDeg2(bb);
+        if(area > MAX_BBOX_AREA){
+          const [minX,minY,maxX,maxY] = bb;
+          const midX = (minX+maxX)/2, midY = (minY+maxY)/2;
+          const tiles = [
+            [minX,minY,midX,midY],
+            [midX,minY,maxX,midY],
+            [minX,midY,midX,maxY],
+            [midX,midY,maxX,maxY],
+          ];
+          for(const tb of tiles){
+            if(out.length >= cap) break;
+            await crawl(tb);
+          }
+          return;
+        }
+
+        // fetch this bb with pagination; skip tile on error
+        try{
+          let remaining = cap - out.length;
+          let limit = Math.min(PER_CALL_LIMIT, remaining);
+          let { data, next } = await fetchBoxOnce(bb, limit);
+
+          for(const img of data){
+            const id = img?.id;
+            if(!id || seen.has(id)) continue;
+            seen.add(id);
+            out.push(img);
+            if(out.length >= cap) break;
+          }
+
+          while(next && out.length < cap){
+            const url = new URL(next);
+            url.searchParams.set("limit", String(Math.min(PER_CALL_LIMIT, cap - out.length)));
+            const res = await fetch(url, { headers:{ Authorization:`OAuth ${TOKEN}` } });
+            if(!res.ok) break;
+            const j = await res.json();
+            const arr = Array.isArray(j.data) ? j.data : [];
+            for(const img of arr){
+              const id = img?.id;
+              if(!id || seen.has(id)) continue;
+              seen.add(id);
+              out.push(img);
+              if(out.length >= cap) break;
+            }
+            next = j?.paging?.next || null;
+          }
+        }catch(err){
+          console.warn("Skipping tile due to error:", err?.message || err);
+          // Skip this tile and continue with others
+        }
+      }
+
+      await crawl(bbox);
+      return out;
     }
 
     async function drawPinsForView(){
       if(!TOKEN || !SHOW_PINS) return;
+      const bbox = bboxFromMap(map);
       status("Loading user pins in view…");
       try{
-        const images = await fetchImagesInBbox({bbox:bboxFromMap(map)});
+        const images = await fetchImagesInBboxTiled({bbox});
         pinLayer.clearLayers(); pinsById = new Map(); selectedPin = null;
 
         for(const img of images){
@@ -254,19 +331,6 @@
         {rot:null, src:'none'}
       );
     }
-    async function readStableCompassRotation(maxWaitMs=3500){
-      const t0=performance.now(); let last=null, stable=0; let result={rot:null,src:'none'};
-      while(performance.now()-t0<maxWaitMs){
-        const r=getCompassRotation();
-        if(r.rot!=null){
-          const diff= last==null ? 999 : Math.abs(((r.rot-last+540)%360)-180);
-          if(diff<0.5){ if(++stable>=3) return r; }
-          else { stable=0; last=r.rot; result=r; }
-        }
-        await sleep(100);
-      }
-      return result;
-    }
 
     // ------------------ Sticky wedge logic ------------------
     let viewer, navLock=0;
@@ -310,7 +374,6 @@
 
         if (SHOW_PINS) selectPinById(id);
 
-        // Update marker/map
         const ll = latlngHint || await getImageLatLng(id);
         if(ll){
           marker.setLatLng(ll);
@@ -328,11 +391,10 @@
       const ViewerCtor=M && M.Viewer;
       if(!ViewerCtor){ status("Mapillary library failed to load."); return; }
 
-      // Use decoded token for viewer too
       viewer=new ViewerCtor({ container:"mly", accessToken:TOKEN });
       try{ viewer.setFieldOfView(FOV_DEG); }catch{}
 
-      // Event: when image changes, sync marker/map and wedge
+      // Sync marker/map & wedge when image changes
       try {
         viewer.on('image', async (ev)=>{
           const id=ev?.image?.id || ev?.imageId || ev?.id;
@@ -347,7 +409,7 @@
         });
       } catch {}
 
-      // Try requested image first; if that fails, fall back to nearest
+      // Open requested image; fall back to nearest
       try{
         status(`Opening image ${START_IMAGE_ID}…`);
         await gotoImage(START_IMAGE_ID);
@@ -359,7 +421,7 @@
         await gotoImage(start.id);
       }
 
-      await reanchorToSticky(); // anchor to WEST (270°)
+      await reanchorToSticky(); // WEST (270°)
       status("");
 
       startCompassWatcher();
