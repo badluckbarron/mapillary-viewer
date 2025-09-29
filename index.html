@@ -67,7 +67,7 @@
     const ROT_SIGN = (-1);
 
     // Start on this image if provided/available:
-    const START_IMAGE_ID = (qs.get("image") || "744575191439794").trim();
+    const START_IMAGE_ID = "744575191439794";
 
     const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
     const dbg    = (t)=>{ const el=document.getElementById('dbg'); if (DEBUG){ el.style.display='block'; el.textContent=t; } };
