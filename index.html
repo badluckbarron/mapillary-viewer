@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Mapillary: all pins by HKocen (split viewer + clustered map)</title>
+  <title>Mapillary: all pins by HKocen (no clustering)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -36,8 +36,8 @@
     const TOKEN      = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
     const START_ID   = "744575191439794";
     const USERNAME   = "HKocen";
-    const MAX_IMAGES = 10000;   // raise if needed
-    const PAGE_LIMIT = 1000;    // /images page size
+    const MAX_IMAGES = 10000;   // raise/lower as needed
+    const PAGE_LIMIT = 1000;    // per-page fetch size
 
     const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
 
@@ -49,7 +49,7 @@
       component: { cover: false, direction: true, zoom: true, attribution: true }
     });
 
-    // Simple camera wedge + position marker on the map
+    // Tiny camera wedge + position marker (for map)
     function makeArcPath(fovDeg) {
       const radius = 45, cx = 50, cy = 50, rad = Math.PI/180 * fovDeg;
       const a0 = -Math.PI/2 - rad/2, a1 = a0 + rad;
@@ -70,7 +70,7 @@
       return el;
     }
 
-    // ===== Map (MapLibre) – OSM raster + glyphs so text layers work =====
+    // ===== Map (MapLibre) – OSM raster style =====
     const OSM_RASTER_STYLE = {
       "version": 8,
       "name": "OSM Raster",
@@ -128,7 +128,6 @@
 
     // ===== Fetch ALL images by username (paged) =====
     async function fetchAllImagesByUser(username, maxImages = MAX_IMAGES) {
-      // Try with 'usernames' first; if empty, fallback to 'creator_username'
       const attempt = async (paramKey) => {
         let out = [];
         let url = new URL("https://graph.mapillary.com/images");
@@ -151,7 +150,6 @@
           const next = j?.paging?.next;
           if (next && out.length < maxImages) {
             url = new URL(next);
-            // make sure the token & filter persist
             if (!url.searchParams.get("access_token")) url.searchParams.set("access_token", TOKEN);
             if (!url.searchParams.get(paramKey)) url.searchParams.set(paramKey, username);
             if (!url.searchParams.get("fields")) url.searchParams.set("fields", "id,computed_geometry");
@@ -168,7 +166,7 @@
       return items;
     }
 
-    // ===== Add pins to map (clustered) =====
+    // ===== Add pins to map (NO clustering) =====
     function addPinsToMap(items) {
       const features = items.map(it => ({
         type: "Feature",
@@ -177,77 +175,42 @@
       }));
       const geojson = { type: "FeatureCollection", features };
 
-      if (map.getLayer("cluster-count")) map.removeLayer("cluster-count");
-      if (map.getLayer("clusters")) map.removeLayer("clusters");
-      if (map.getLayer("unclustered")) map.removeLayer("unclustered");
+      // Clean up old layers/sources if reloading
+      ["pins-dots"].forEach(id => { if (map.getLayer(id)) map.removeLayer(id); });
       if (map.getSource("pins")) map.removeSource("pins");
 
-      map.addSource("pins", {
-        type: "geojson",
-        data: geojson,
-        cluster: true,
-        clusterRadius: 40,
-        clusterMaxZoom: 14
-      });
+      map.addSource("pins", { type: "geojson", data: geojson });
 
+      // Single-dot style for every image
       map.addLayer({
-        id: "clusters",
+        id: "pins-dots",
         type: "circle",
         source: "pins",
-        filter: ["has", "point_count"],
-        paint: {
-          "circle-color": "#2b7a0b",
-          "circle-opacity": 0.85,
-          "circle-stroke-width": 2,
-          "circle-stroke-color": "#0b3d0b",
-          "circle-radius": ["step", ["get","point_count"], 14, 50, 18, 200, 24]
-        }
-      });
-
-      map.addLayer({
-        id: "cluster-count",
-        type: "symbol",
-        source: "pins",
-        filter: ["has", "point_count"],
-        layout: {
-          "text-field": ["get","point_count_abbreviated"],
-          "text-size": 12
-        },
-        paint: { "text-color": "#ffffff" }
-      });
-
-      map.addLayer({
-        id: "unclustered",
-        type: "circle",
-        source: "pins",
-        filter: ["!", ["has", "point_count"]],
         paint: {
           "circle-color": "#1b5e20",
-          "circle-radius": 5,
+          "circle-opacity": 0.95,
+          "circle-radius": [
+            "interpolate", ["linear"], ["zoom"],
+            3, 2,
+            8, 3,
+            12, 4,
+            19, 6
+          ],
           "circle-stroke-width": 2,
           "circle-stroke-color": "#9cff9c"
         }
       });
 
-      // Click behavior
-      map.on("click", "clusters", async (e) => {
-        const f = map.queryRenderedFeatures(e.point, { layers: ["clusters"] })[0];
-        const src = map.getSource("pins");
-        const zoom = await src.getClusterExpansionZoom(f.properties.cluster_id);
-        map.easeTo({ center: f.geometry.coordinates, zoom });
+      // Click: move viewer to that image
+      map.on("click", "pins-dots", (e) => {
+        const f = map.queryRenderedFeatures(e.point, { layers: ["pins-dots"] })[0];
+        if (f?.properties?.id) viewer.moveTo(f.properties.id).catch(()=>{});
       });
 
-      map.on("click", "unclustered", (e) => {
-        const f = map.queryRenderedFeatures(e.point, { layers: ["unclustered"] })[0];
-        viewer.moveTo(f.properties.id).catch(()=>{});
-      });
+      map.on("mouseenter", "pins-dots", ()=> map.getCanvas().style.cursor = "pointer");
+      map.on("mouseleave", "pins-dots", ()=> map.getCanvas().style.cursor = "");
 
-      map.on("mouseenter", "clusters", ()=> map.getCanvas().style.cursor = "pointer");
-      map.on("mouseleave", "clusters", ()=> map.getCanvas().style.cursor = "");
-      map.on("mouseenter", "unclustered", ()=> map.getCanvas().style.cursor = "pointer");
-      map.on("mouseleave", "unclustered", ()=> map.getCanvas().style.cursor = "");
-
-      // Fit to pins
+      // Fit to all pins
       if (features.length) {
         const b = new maplibregl.LngLatBounds(features[0].geometry.coordinates, features[0].geometry.coordinates);
         for (const ft of features) b.extend(ft.geometry.coordinates);
@@ -257,20 +220,16 @@
       }
     }
 
-    // Helper: run now if map is already loaded, else on next 'load'
     function addPinsWhenReady(items) {
-      if (map.loaded() || map.isStyleLoaded?.()) {
-        addPinsToMap(items);
-      } else {
-        map.once("load", () => addPinsToMap(items));
-      }
+      if (map.loaded() || map.isStyleLoaded?.()) addPinsToMap(items);
+      else map.once("load", () => addPinsToMap(items));
     }
 
     // ===== Boot =====
     (async () => {
       try {
         const items = await fetchAllImagesByUser(USERNAME, MAX_IMAGES);
-        addPinsWhenReady(items);   // <— critical fix for your “no pins” case
+        addPinsWhenReady(items);
       } catch (err) {
         status("Failed to load pins");
         console.error(err);
