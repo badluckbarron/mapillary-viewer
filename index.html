@@ -42,8 +42,8 @@
     const MIN_ZOOM_FOR_PINS  = 16;     // don't fetch pins until zoomed-in
 
     // Sticky wedge settings
-    const FOV_DEG      = 60;          // wedge/field-of-view angle
-    const ROT_SIGN     = -1;          // -1 => wedge follows camera yaw direction
+    const FOV_DEG       = 60;         // wedge/field-of-view angle
+    const ROT_SIGN      = -1;         // -1 => wedge follows camera yaw direction
     const START_BEARING = 270;        // initialize wedge facing west
 
     // ====== Utilities ======
@@ -129,11 +129,12 @@
       component: { cover: true, direction: true, zoom: true, attribution: true }
     });
 
-    // ====== Graph helpers ======
+    // ====== Graph helpers (use access_token query + usernames) ======
     async function getImageLatLng(imageId) {
       const u = new URL(`https://graph.mapillary.com/${encodeURIComponent(imageId)}`);
       u.searchParams.set("fields", "computed_geometry");
-      const res = await fetch(u, { headers: { Authorization: `OAuth ${TOKEN}` }});
+      u.searchParams.set("access_token", TOKEN);
+      const res = await fetch(u);
       if (!res.ok) return null;
       const j = await res.json();
       const c = j?.computed_geometry?.coordinates;
@@ -141,17 +142,18 @@
     }
 
     async function fetchImagesForTile(bbox, limit = PER_TILE_LIMIT) {
-      const bboxStr = bbox.map(v => v.toFixed(6)).join(',');
-      const base = "https://graph.mapillary.com/images";
-      const qs = [
+      // Clean, comma-joined bbox: west,south,east,north
+      const bboxStr = bbox.map(v => v.toFixed(7)).join(',');
+      const params = [
         "fields=id,computed_geometry",
         `bbox=${bboxStr}`,
         `limit=${encodeURIComponent(String(limit))}`,
-        USERNAME ? `creator_username=${encodeURIComponent(USERNAME)}` : null,
-      ].filter(Boolean).join("&");
-      const url = `${base}?${qs}`;
+        `usernames=${encodeURIComponent(USERNAME)}`,
+        `access_token=${encodeURIComponent(TOKEN)}`,
+      ].join("&");
+      const url = `https://graph.mapillary.com/images?${params}`;
 
-      const res = await fetch(url, { headers: { Authorization: `OAuth ${TOKEN}` }});
+      const res = await fetch(url);
       if (!res.ok) {
         const t = await res.text().catch(() => res.statusText);
         throw new Error(`API ${res.status}: ${t}`);
@@ -186,7 +188,6 @@
             features.push({ id: img.id, lat: c[1], lng: c[0] });
           }
         } catch (err) {
-          // keep going even if one tile errors
           console.warn("Tile fetch failed:", err.message);
         }
       }
