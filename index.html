@@ -2,26 +2,36 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Mapillary: HKocen pins after 2025-06-01 (no clustering)</title>
+  <title>Mapillary: HKocen pins after date (no clustering)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-
   <!-- MapillaryJS -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.css" />
   <script src="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.min.js"></script>
-
   <!-- MapLibre GL -->
   <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
   <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
-
   <style>
     html, body { height: 100%; margin: 0; }
     #wrap { position: relative; height: 100vh; width: 100%; }
     #viewer, #map { position: absolute; top: 0; height: 100%; }
     #viewer { left: 0; width: 61.8%; }
-    #map    { right: 0; width: calc(38.2% - 2px); margin-left: 2px; }
-    #msg { position: absolute; left: 8px; top: 8px; z-index: 1000;
-           background: rgba(0,0,0,.6); color:#fff; padding:6px 10px; border-radius:6px;
-           font: 13px/1.3 system-ui, sans-serif; }
+    #map    { right: 0; width: calc(38.2% - 2px); }
+    #msg {
+      position: absolute; left: 8px; top: 8px; z-index: 1000;
+      background: rgba(0,0,0,.7); color:#fff; padding:6px 10px; border-radius:6px;
+      font: 13px/1.3 system-ui, sans-serif;
+      max-width: min(48vw, 720px);
+      white-space: pre-line;
+    }
+    #msg.error { background: rgba(160, 0, 0, .85); }
+    #controls {
+      position: absolute; right: 8px; top: 8px; z-index: 1000;
+      background: rgba(255,255,255,.9); color:#222; padding: 6px 8px; border-radius: 6px;
+      font: 13px/1.3 system-ui, sans-serif; display: flex; gap: 6px; align-items: center;
+      box-shadow: 0 2px 10px rgba(0,0,0,.15);
+    }
+    #controls input { padding: 3px 6px; font: inherit; }
+    #controls button { padding: 4px 8px; font: inherit; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -29,20 +39,50 @@
     <div id="viewer"></div>
     <div id="map"></div>
     <div id="msg">Loading…</div>
+    <div id="controls">
+      <label for="after">After (UTC):</label>
+      <input id="after" type="date" />
+      <button id="apply">Apply</button>
+      <span id="count"></span>
+    </div>
   </div>
 
   <script>
     // ===== Config =====
-    const TOKEN       = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
-    const START_ID    = "744575191439794";
-    const USERNAME    = "HKocen";
-    const MAX_IMAGES  = 10000;
-    const PAGE_LIMIT  = 1000;
-    const CUTOFF_ISO  = "2025-06-01T00:00:00Z"; // include images captured on/after this moment (UTC)
+    const TOKEN     = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
+    const START_ID  = "744575191439794";
+    const USERNAME  = "HKocen";
+    const MAX_IMAGES = 10000;
+    const PAGE_LIMIT = 1000;
 
-    const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
+    // Read ?after=YYYY-MM-DD (optional). Default to 2025-06-01 if not set.
+    const qs = new URLSearchParams(location.search);
+    const afterParam = qs.get("after"); // e.g., 2025-05-01
+    const DEFAULT_AFTER = "2025-06-01";
+    const afterDateStr = /^\d{4}-\d{2}-\d{2}$/.test(afterParam || "") ? afterParam : DEFAULT_AFTER;
+    const CUTOFF_ISO = afterDateStr + "T00:00:00Z";
 
-    // ===== Viewer =====
+    // Status helpers
+    const $msg = document.getElementById("msg");
+    const $count = document.getElementById("count");
+    function status(t, isError=false) {
+      $msg.textContent = t || "";
+      $msg.classList.toggle("error", !!isError);
+    }
+    function setCount(n){ $count.textContent = n!=null ? `Count: ${n}` : ""; }
+
+    // Wire the little date control (also updates the URL so you can bookmark/share)
+    const $afterInput = document.getElementById("after");
+    $afterInput.value = afterDateStr;
+    document.getElementById("apply").addEventListener("click", ()=>{
+      const d = $afterInput.value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) { alert("Use format YYYY-MM-DD"); return; }
+      const u = new URL(location.href);
+      u.searchParams.set("after", d);
+      location.href = u.toString();
+    });
+
+    // ===== Viewer (left) =====
     const viewer = new mapillary.Viewer({
       container: "viewer",
       accessToken: TOKEN,
@@ -50,7 +90,7 @@
       component: { cover: false, direction: true, zoom: true, attribution: true }
     });
 
-    // Tiny camera wedge + position marker
+    // Small camera wedge + position marker on the map
     function makeArcPath(fovDeg) {
       const radius = 45, cx = 50, cy = 50, rad = Math.PI/180 * fovDeg;
       const a0 = -Math.PI/2 - rad/2, a1 = a0 + rad;
@@ -62,16 +102,14 @@
       const path = document.createElementNS('http://www.w3.org/2000/svg','path');
       path.setAttribute('d', makeArcPath(fovDeg));
       path.setAttribute('fill','yellow'); path.setAttribute('fill-opacity','0.5');
-      path.setAttribute('stroke','black'); path.setAttribute('stroke-width','1');
-      path.setAttribute('stroke-linejoin','round');
-      const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
-      svg.setAttribute('viewBox','0 0 100 100'); svg.appendChild(path);
+      path.setAttribute('stroke','black'); path.setAttribute('stroke-width','1'); path.setAttribute('stroke-linejoin','round');
+      const svg = document.createElementNS('http://www.w3.org/2000/svg','svg'); svg.setAttribute('viewBox','0 0 100 100'); svg.appendChild(path);
       svg.style.height='100%'; svg.style.width='100%'; svg.style.transform = `rotateZ(${bearingDeg}deg)`;
       const el = document.createElement('div'); el.style.height='200px'; el.style.width='200px'; el.appendChild(svg);
       return el;
     }
 
-    // ===== Map (MapLibre) – OSM raster style =====
+    // ===== Map (right) =====
     const OSM_RASTER_STYLE = {
       "version": 8,
       "name": "OSM Raster",
@@ -80,9 +118,7 @@
         "osm": {
           "type": "raster",
           "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-          "tileSize": 256,
-          "minzoom": 0,
-          "maxzoom": 19,
+          "tileSize": 256, "minzoom": 0, "maxzoom": 19,
           "attribution": "© OpenStreetMap contributors"
         }
       },
@@ -96,7 +132,7 @@
       container: "map",
       style: OSM_RASTER_STYLE,
       center: [-91.965153, 30.138307],
-      zoom: 14
+      zoom: 5
     });
 
     const cameraEl = makeCamera(0, 90);
@@ -127,31 +163,33 @@
     });
     window.addEventListener('resize', ()=>viewer.emit && viewer.emit('fov'));
 
-    // ===== Fetch ALL images by username (paged), filtered by captured_at >= CUTOFF_ISO =====
+    // ===== Fetch ALL images by user (paged), filtered by captured_at >= CUTOFF_ISO =====
     async function fetchAllImagesByUser(username, maxImages = MAX_IMAGES) {
       const attempt = async (paramKey) => {
         const cutoffMs = Date.parse(CUTOFF_ISO);
         let out = [];
         let url = new URL("https://graph.mapillary.com/images");
         url.searchParams.set("fields", "id,computed_geometry,captured_at");
-        url.searchParams.set(paramKey, username);
-        url.searchParams.set("start_captured_at", CUTOFF_ISO);
+        url.searchParams.set(paramKey, username);                 // usernames=... or creator_username=...
+        url.searchParams.set("start_captured_at", CUTOFF_ISO);    // server-side date filter
         url.searchParams.set("limit", String(Math.min(PAGE_LIMIT, maxImages)));
         url.searchParams.set("access_token", TOKEN);
 
         while (url && out.length < maxImages) {
-          status(`Loading pins by ${username} (>= ${CUTOFF_ISO})… ${out.length} fetched`);
+          status(`Fetching (>= ${CUTOFF_ISO}) for ${username}… ${out.length} fetched`);
           const res = await fetch(url);
-          if (!res.ok) throw new Error(`API ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
+          if (!res.ok) {
+            const t = await res.text().catch(()=>res.statusText);
+            throw new Error(`API ${res.status}: ${t}`);
+          }
           const j = await res.json();
           const data = Array.isArray(j.data) ? j.data : [];
           for (const d of data) {
             const c = d?.computed_geometry?.coordinates;
             const ts = d?.captured_at ? Date.parse(d.captured_at) : NaN;
             if (!Array.isArray(c) || c.length !== 2) continue;
-            // extra client-side guard against any stray pre-cutoff rows
-            if (!Number.isNaN(ts) && ts < cutoffMs) continue;
-            out.push({ id: d.id, lng: c[0], lat: c[1], captured_at: d.captured_at || null });
+            if (!Number.isNaN(ts) && ts < cutoffMs) continue; // extra local guard
+            out.push({ id: d.id, lng: c[0], lat: c[1], captured_at: d.captured_at || "" });
             if (out.length >= maxImages) break;
           }
           const next = j?.paging?.next;
@@ -168,19 +206,20 @@
         return out;
       };
 
-      // Prefer 'usernames', fall back to 'creator_username'
+      // Try modern filter first, then fallback
       let items = await attempt("usernames");
       if (items.length === 0) items = await attempt("creator_username");
       status(`Pins loaded (>= ${CUTOFF_ISO}): ${items.length}`);
+      setCount(items.length);
       return items;
     }
 
-    // ===== Add pins to map (NO clustering) =====
+    // ===== Render pins (no clustering) =====
     function addPinsToMap(items) {
       const features = items.map(it => ({
         type: "Feature",
         geometry: { type: "Point", coordinates: [it.lng, it.lat] },
-        properties: { id: it.id, captured_at: it.captured_at || "" }
+        properties: { id: it.id, captured_at: it.captured_at }
       }));
       const geojson = { type: "FeatureCollection", features };
 
@@ -196,13 +235,7 @@
         paint: {
           "circle-color": "#1b5e20",
           "circle-opacity": 0.95,
-          "circle-radius": [
-            "interpolate", ["linear"], ["zoom"],
-            3, 2,
-            8, 3,
-            12, 4,
-            19, 6
-          ],
+          "circle-radius": ["interpolate", ["linear"], ["zoom"], 3, 2, 8, 3, 12, 4, 19, 6],
           "circle-stroke-width": 2,
           "circle-stroke-color": "#9cff9c"
         }
@@ -212,7 +245,6 @@
         const f = map.queryRenderedFeatures(e.point, { layers: ["pins-dots"] })[0];
         if (f?.properties?.id) viewer.moveTo(f.properties.id).catch(()=>{});
       });
-
       map.on("mouseenter", "pins-dots", ()=> map.getCanvas().style.cursor = "pointer");
       map.on("mouseleave", "pins-dots", ()=> map.getCanvas().style.cursor = "");
 
@@ -220,8 +252,9 @@
         const b = new maplibregl.LngLatBounds(features[0].geometry.coordinates, features[0].geometry.coordinates);
         for (const ft of features) b.extend(ft.geometry.coordinates);
         map.fitBounds(b, { padding: 30, maxZoom: 12 });
+        status(`Showing ${features.length} pins (after ${CUTOFF_ISO})`);
       } else {
-        status("No pins found for this user after 2025-06-01.");
+        status(`No pins found for ${USERNAME} after ${CUTOFF_ISO}. Try an earlier date via ?after=YYYY-MM-DD or the control at top-right.`, true);
       }
     }
 
@@ -233,11 +266,12 @@
     // ===== Boot =====
     (async () => {
       try {
+        status(`Cutoff: ${CUTOFF_ISO}\nFetching images…`);
         const items = await fetchAllImagesByUser(USERNAME, MAX_IMAGES);
         addPinsWhenReady(items);
       } catch (err) {
-        status("Failed to load pins");
         console.error(err);
+        status(`Failed to load pins: ${err.message || err}`, true);
       }
     })();
   </script>
