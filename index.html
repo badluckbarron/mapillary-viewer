@@ -2,14 +2,14 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Mapillary: all pins by HKocen (split viewer + map)</title>
+  <title>Mapillary: all pins by HKocen (split viewer + clustered map)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.css" />
   <script src="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.min.js"></script>
 
-  <!-- MapLibre GL (Mapbox GL compatible) -->
+  <!-- MapLibre GL -->
   <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
   <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
 
@@ -36,10 +36,8 @@
     const TOKEN     = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
     const START_ID  = "744575191439794";
     const USERNAME  = "HKocen";
-
-    // Cap total images to avoid overloading the browser (raise if you like)
-    const MAX_IMAGES   = 10000;   // safety cap
-    const PAGE_LIMIT   = 1000;    // Graph API per-page limit
+    const MAX_IMAGES = 10000;   // raise if needed
+    const PAGE_LIMIT = 1000;    // /images page size
 
     const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
 
@@ -68,25 +66,28 @@
       const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
       svg.setAttribute('viewBox','0 0 100 100'); svg.appendChild(path);
       svg.style.height='100%'; svg.style.width='100%'; svg.style.transform = `rotateZ(${bearingDeg}deg)`;
-      const container = document.createElement('div'); container.style.height='200px'; container.style.width='200px';
-      container.appendChild(svg);
-      return container;
+      const el = document.createElement('div'); el.style.height='200px'; el.style.width='200px'; el.appendChild(svg);
+      return el;
     }
 
-    // ===== Map (MapLibre GL) with OSM raster style (z up to 19) =====
+    // ===== Map (MapLibre) – OSM raster + glyphs so text layers work =====
     const OSM_RASTER_STYLE = {
-      "version": 8, "name": "OSM Raster",
+      "version": 8,
+      "name": "OSM Raster",
+      "glyphs": "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
       "sources": {
         "osm": {
-          "type":"raster",
-          "tiles":["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-          "tileSize":256,"minzoom":0,"maxzoom":19,
-          "attribution":"© OpenStreetMap contributors"
+          "type": "raster",
+          "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+          "tileSize": 256,
+          "minzoom": 0,
+          "maxzoom": 19,
+          "attribution": "© OpenStreetMap contributors"
         }
       },
-      "layers":[
-        {"id":"bg","type":"background","paint":{"background-color":"#e6f2d8"}},
-        {"id":"osm","type":"raster","source":"osm"}
+      "layers": [
+        { "id": "bg", "type": "background", "paint": { "background-color": "#e6f2d8" } },
+        { "id": "osm", "type": "raster", "source": "osm" }
       ]
     };
 
@@ -94,24 +95,23 @@
       container: "map",
       style: OSM_RASTER_STYLE,
       center: [-91.965153, 30.138307],
-      zoom: 5,
-      pitch: 0
+      zoom: 5
     });
 
+    // Camera wedge + position marker
     const cameraEl = makeCamera(0, 90);
     const cameraMarker = new maplibregl.Marker({ element: cameraEl, rotationAlignment: "map" });
     const posDot = document.createElement('div');
     posDot.style.cssText="width:14px;height:14px;border:3px solid #ff2a6d;border-radius:50%;background:#fff9";
     const positionMarker = new maplibregl.Marker({ element: posDot, rotationAlignment: "map" });
 
-    // Sync viewer -> map position + camera wedge
     async function syncPosition() {
       try {
-        const p = await viewer.getPosition();      // {lng, lat}
-        const pov = await viewer.getPointOfView(); // {bearing, tilt, roll}
+        const p = await viewer.getPosition();
+        const pov = await viewer.getPointOfView();
         positionMarker.setLngLat([p.lng, p.lat]).addTo(map);
         cameraMarker.setLngLat([p.lng, p.lat]).addTo(map);
-        const svg = cameraEl.querySelector('svg'); svg.style.transform = `rotateZ(${pov.bearing}deg)`;
+        cameraEl.querySelector('svg').style.transform = `rotateZ(${pov.bearing}deg)`;
       } catch {}
     }
     viewer.on('load', syncPosition);
@@ -123,8 +123,7 @@
       const vFov = Math.PI/180 * (await viewer.getFieldOfView());
       const aspect = vc.offsetHeight ? vc.offsetWidth / vc.offsetHeight : 0;
       const hFovDeg = Math.atan(aspect * Math.tan(0.5*vFov)) * 2 * 180/Math.PI;
-      const path = cameraEl.querySelector('path');
-      path.setAttribute('d', makeArcPath(hFovDeg));
+      cameraEl.querySelector('path').setAttribute('d', makeArcPath(hFovDeg));
     });
     window.addEventListener('resize', ()=>viewer.emit && viewer.emit('fov'));
 
@@ -151,7 +150,6 @@
         const next = j?.paging?.next;
         if (next && out.length < maxImages) {
           url = new URL(next);
-          // ensure token sticks around
           if (!url.searchParams.get("access_token")) url.searchParams.set("access_token", TOKEN);
         } else {
           url = null;
@@ -161,7 +159,7 @@
       return out;
     }
 
-    // ===== Add pins to map as a clustered GeoJSON source =====
+    // ===== Add pins to map (clustered) =====
     function addPinsToMap(items) {
       const features = items.map(it => ({
         type: "Feature",
@@ -179,7 +177,6 @@
         clusterMaxZoom: 14
       });
 
-      // clusters
       map.addLayer({
         id: "clusters",
         type: "circle",
@@ -190,24 +187,22 @@
           "circle-opacity": 0.85,
           "circle-stroke-width": 2,
           "circle-stroke-color": "#0b3d0b",
-          "circle-radius": [
-            "step", ["get","point_count"], 14, 50, 18, 200, 24
-          ]
+          "circle-radius": ["step", ["get","point_count"], 14, 50, 18, 200, 24]
         }
       });
+
       map.addLayer({
         id: "cluster-count",
         type: "symbol",
         source: "pins",
         filter: ["has", "point_count"],
         layout: {
-          "text-field": ["to-string", ["get","point_count"]],
+          "text-field": ["get","point_count_abbreviated"],
           "text-size": 12
         },
         paint: { "text-color": "#ffffff" }
       });
 
-      // single points
       map.addLayer({
         id: "unclustered",
         type: "circle",
@@ -221,7 +216,6 @@
         }
       });
 
-      // Click handlers
       map.on("click", "clusters", async (e) => {
         const f = map.queryRenderedFeatures(e.point, { layers: ["clusters"] })[0];
         const src = map.getSource("pins");
@@ -231,8 +225,7 @@
 
       map.on("click", "unclustered", (e) => {
         const f = map.queryRenderedFeatures(e.point, { layers: ["unclustered"] })[0];
-        const id = f.properties.id;
-        viewer.moveTo(id).catch(()=>{});
+        viewer.moveTo(f.properties.id).catch(()=>{});
       });
 
       map.on("mouseenter", "clusters", ()=> map.getCanvas().style.cursor = "pointer");
@@ -240,7 +233,7 @@
       map.on("mouseenter", "unclustered", ()=> map.getCanvas().style.cursor = "pointer");
       map.on("mouseleave", "unclustered", ()=> map.getCanvas().style.cursor = "");
 
-      // Fit to all pins
+      // Fit to pins
       if (features.length) {
         const b = new maplibregl.LngLatBounds(features[0].geometry.coordinates, features[0].geometry.coordinates);
         for (const ft of features) b.extend(ft.geometry.coordinates);
