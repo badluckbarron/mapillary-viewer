@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Mapillary: HKocen pins after 2025-06-01 (no clustering)</title>
+  <title>Mapillary: all pins by HKocen (no clustering)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -33,12 +33,11 @@
 
   <script>
     // ===== Config =====
-    const TOKEN       = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
-    const START_ID    = "744575191439794";
-    const USERNAME    = "HKocen";
-    const MAX_IMAGES  = 10000;
-    const PAGE_LIMIT  = 1000;
-    const CUTOFF_ISO  = "2025-05-31T00:00:00Z"; // include images captured on/after this moment (UTC)
+    const TOKEN      = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
+    const START_ID   = "744575191439794";
+    const USERNAME   = "HKocen";
+    const MAX_IMAGES = 20000;   // raise/lower as needed
+    const PAGE_LIMIT = 1000;    // per-page fetch size
 
     const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
 
@@ -50,7 +49,7 @@
       component: { cover: false, direction: true, zoom: true, attribution: true }
     });
 
-    // Tiny camera wedge + position marker
+    // Tiny camera wedge + position marker (for map)
     function makeArcPath(fovDeg) {
       const radius = 45, cx = 50, cy = 50, rad = Math.PI/180 * fovDeg;
       const a0 = -Math.PI/2 - rad/2, a1 = a0 + rad;
@@ -127,40 +126,33 @@
     });
     window.addEventListener('resize', ()=>viewer.emit && viewer.emit('fov'));
 
-    // ===== Fetch ALL images by username (paged), filtered by captured_at >= CUTOFF_ISO =====
+    // ===== Fetch ALL images by username (paged) =====
     async function fetchAllImagesByUser(username, maxImages = MAX_IMAGES) {
       const attempt = async (paramKey) => {
-        const cutoffMs = Date.parse(CUTOFF_ISO);
         let out = [];
         let url = new URL("https://graph.mapillary.com/images");
-        url.searchParams.set("fields", "id,computed_geometry,captured_at");
+        url.searchParams.set("fields", "id,computed_geometry");
         url.searchParams.set(paramKey, username);
-        url.searchParams.set("start_captured_at", CUTOFF_ISO);
         url.searchParams.set("limit", String(Math.min(PAGE_LIMIT, maxImages)));
         url.searchParams.set("access_token", TOKEN);
 
         while (url && out.length < maxImages) {
-          status(`Loading pins by ${username} (>= ${CUTOFF_ISO})… ${out.length} fetched`);
+          status(`Loading pins by ${username}… ${out.length} fetched`);
           const res = await fetch(url);
           if (!res.ok) throw new Error(`API ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
           const j = await res.json();
           const data = Array.isArray(j.data) ? j.data : [];
           for (const d of data) {
             const c = d?.computed_geometry?.coordinates;
-            const ts = d?.captured_at ? Date.parse(d.captured_at) : NaN;
-            if (!Array.isArray(c) || c.length !== 2) continue;
-            // extra client-side guard against any stray pre-cutoff rows
-            if (!Number.isNaN(ts) && ts < cutoffMs) continue;
-            out.push({ id: d.id, lng: c[0], lat: c[1], captured_at: d.captured_at || null });
+            if (Array.isArray(c) && c.length === 2) out.push({ id: d.id, lng: c[0], lat: c[1] });
             if (out.length >= maxImages) break;
           }
           const next = j?.paging?.next;
           if (next && out.length < maxImages) {
             url = new URL(next);
-            if (!url.searchParams.get("access_token"))       url.searchParams.set("access_token", TOKEN);
-            if (!url.searchParams.get(paramKey))             url.searchParams.set(paramKey, username);
-            if (!url.searchParams.get("fields"))             url.searchParams.set("fields", "id,computed_geometry,captured_at");
-            if (!url.searchParams.get("start_captured_at"))  url.searchParams.set("start_captured_at", CUTOFF_ISO);
+            if (!url.searchParams.get("access_token")) url.searchParams.set("access_token", TOKEN);
+            if (!url.searchParams.get(paramKey)) url.searchParams.set(paramKey, username);
+            if (!url.searchParams.get("fields")) url.searchParams.set("fields", "id,computed_geometry");
           } else {
             url = null;
           }
@@ -168,10 +160,9 @@
         return out;
       };
 
-      // Prefer 'usernames', fall back to 'creator_username'
       let items = await attempt("usernames");
       if (items.length === 0) items = await attempt("creator_username");
-      status(`Pins loaded (>= ${CUTOFF_ISO}): ${items.length}`);
+      status(`Pins loaded: ${items.length}`);
       return items;
     }
 
@@ -180,15 +171,17 @@
       const features = items.map(it => ({
         type: "Feature",
         geometry: { type: "Point", coordinates: [it.lng, it.lat] },
-        properties: { id: it.id, captured_at: it.captured_at || "" }
+        properties: { id: it.id }
       }));
       const geojson = { type: "FeatureCollection", features };
 
-      if (map.getLayer("pins-dots")) map.removeLayer("pins-dots");
+      // Clean up old layers/sources if reloading
+      ["pins-dots"].forEach(id => { if (map.getLayer(id)) map.removeLayer(id); });
       if (map.getSource("pins")) map.removeSource("pins");
 
       map.addSource("pins", { type: "geojson", data: geojson });
 
+      // Single-dot style for every image
       map.addLayer({
         id: "pins-dots",
         type: "circle",
@@ -208,6 +201,7 @@
         }
       });
 
+      // Click: move viewer to that image
       map.on("click", "pins-dots", (e) => {
         const f = map.queryRenderedFeatures(e.point, { layers: ["pins-dots"] })[0];
         if (f?.properties?.id) viewer.moveTo(f.properties.id).catch(()=>{});
@@ -216,12 +210,13 @@
       map.on("mouseenter", "pins-dots", ()=> map.getCanvas().style.cursor = "pointer");
       map.on("mouseleave", "pins-dots", ()=> map.getCanvas().style.cursor = "");
 
+      // Fit to all pins
       if (features.length) {
         const b = new maplibregl.LngLatBounds(features[0].geometry.coordinates, features[0].geometry.coordinates);
         for (const ft of features) b.extend(ft.geometry.coordinates);
         map.fitBounds(b, { padding: 30, maxZoom: 12 });
       } else {
-        status("No pins found for this user after 2025-06-01.");
+        status("No pins found for this user.");
       }
     }
 
