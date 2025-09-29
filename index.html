@@ -2,26 +2,27 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Mapillary: all pins by HKocen (no clustering)</title>
+  <title>Mapillary: HKocen pins after date (no clustering, strict user filter)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-
   <!-- MapillaryJS -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.css" />
   <script src="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.min.js"></script>
-
   <!-- MapLibre GL -->
   <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
   <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
-
   <style>
     html, body { height: 100%; margin: 0; }
     #wrap { position: relative; height: 100vh; width: 100%; }
     #viewer, #map { position: absolute; top: 0; height: 100%; }
     #viewer { left: 0; width: 61.8%; }
-    #map    { right: 0; width: calc(38.2% - 2px); margin-left: 2px; }
-    #msg { position: absolute; left: 8px; top: 8px; z-index: 1000;
-           background: rgba(0,0,0,.6); color:#fff; padding:6px 10px; border-radius:6px;
-           font: 13px/1.3 system-ui, sans-serif; }
+    #map    { right: 0; width: calc(38.2% - 2px); }
+    #msg {
+      position: absolute; left: 8px; top: 8px; z-index: 1000;
+      background: rgba(0,0,0,.7); color:#fff; padding:6px 10px; border-radius:6px;
+      font: 13px/1.3 system-ui, sans-serif;
+      max-width: min(48vw, 720px); white-space: pre-line;
+    }
+    #msg.error { background: rgba(160, 0, 0, .85); }
   </style>
 </head>
 <body>
@@ -36,12 +37,20 @@
     const TOKEN      = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
     const START_ID   = "744575191439794";
     const USERNAME   = "HKocen";
-    const MAX_IMAGES = 20000;   // raise/lower as needed
-    const PAGE_LIMIT = 1000;    // per-page fetch size
+    const MAX_IMAGES = 10000;
+    const PAGE_LIMIT = 1000;
 
-    const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
+    // Date cutoff: default 2025-06-01, override with ?after=YYYY-MM-DD
+    const qs = new URLSearchParams(location.search);
+    const afterParam = qs.get("after");
+    const DEFAULT_AFTER = "2025-06-01";
+    const afterDateStr = /^\d{4}-\d{2}-\d{2}$/.test(afterParam || "") ? afterParam : DEFAULT_AFTER;
+    const CUTOFF_ISO = afterDateStr + "T00:00:00Z";
 
-    // ===== Viewer =====
+    const $msg = document.getElementById("msg");
+    const status = (t, isError=false)=>{ $msg.textContent = t || ""; $msg.classList.toggle("error", !!isError); };
+
+    // ===== Viewer (left) =====
     const viewer = new mapillary.Viewer({
       container: "viewer",
       accessToken: TOKEN,
@@ -49,28 +58,26 @@
       component: { cover: false, direction: true, zoom: true, attribution: true }
     });
 
-    // Tiny camera wedge + position marker (for map)
+    // Camera wedge + position marker
     function makeArcPath(fovDeg) {
-      const radius = 45, cx = 50, cy = 50, rad = Math.PI/180 * fovDeg;
-      const a0 = -Math.PI/2 - rad/2, a1 = a0 + rad;
-      const x0 = cx + radius * Math.cos(a0), y0 = cy + radius * Math.sin(a0);
-      const x1 = cx + radius * Math.cos(a1), y1 = cy + radius * Math.sin(a1);
-      return `M ${cx} ${cy} L ${x0} ${y0} A ${radius} ${radius} 0 0 1 ${x1} ${y1} Z`;
+      const r=45, cx=50, cy=50, rad=Math.PI/180*fovDeg;
+      const a0=-Math.PI/2-rad/2, a1=a0+rad;
+      const x0=cx+r*Math.cos(a0), y0=cy+r*Math.sin(a0);
+      const x1=cx+r*Math.cos(a1), y1=cy+r*Math.sin(a1);
+      return `M ${cx} ${cy} L ${x0} ${y0} A ${r} ${r} 0 0 1 ${x1} ${y1} Z`;
     }
     function makeCamera(bearingDeg, fovDeg) {
-      const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+      const path=document.createElementNS('http://www.w3.org/2000/svg','path');
       path.setAttribute('d', makeArcPath(fovDeg));
       path.setAttribute('fill','yellow'); path.setAttribute('fill-opacity','0.5');
-      path.setAttribute('stroke','black'); path.setAttribute('stroke-width','1');
-      path.setAttribute('stroke-linejoin','round');
-      const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
-      svg.setAttribute('viewBox','0 0 100 100'); svg.appendChild(path);
-      svg.style.height='100%'; svg.style.width='100%'; svg.style.transform = `rotateZ(${bearingDeg}deg)`;
-      const el = document.createElement('div'); el.style.height='200px'; el.style.width='200px'; el.appendChild(svg);
+      path.setAttribute('stroke','black'); path.setAttribute('stroke-width','1'); path.setAttribute('stroke-linejoin','round');
+      const svg=document.createElementNS('http://www.w3.org/2000/svg','svg'); svg.setAttribute('viewBox','0 0 100 100'); svg.appendChild(path);
+      svg.style.height='100%'; svg.style.width='100%'; svg.style.transform=`rotateZ(${bearingDeg}deg)`;
+      const el=document.createElement('div'); el.style.height='200px'; el.style.width='200px'; el.appendChild(svg);
       return el;
     }
 
-    // ===== Map (MapLibre) – OSM raster style =====
+    // ===== Map (right) =====
     const OSM_RASTER_STYLE = {
       "version": 8,
       "name": "OSM Raster",
@@ -79,9 +86,7 @@
         "osm": {
           "type": "raster",
           "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-          "tileSize": 256,
-          "minzoom": 0,
-          "maxzoom": 19,
+          "tileSize": 256, "minzoom": 0, "maxzoom": 19,
           "attribution": "© OpenStreetMap contributors"
         }
       },
@@ -95,7 +100,7 @@
       container: "map",
       style: OSM_RASTER_STYLE,
       center: [-91.965153, 30.138307],
-      zoom: 14
+      zoom: 5
     });
 
     const cameraEl = makeCamera(0, 90);
@@ -126,62 +131,69 @@
     });
     window.addEventListener('resize', ()=>viewer.emit && viewer.emit('fov'));
 
-    // ===== Fetch ALL images by username (paged) =====
-    async function fetchAllImagesByUser(username, maxImages = MAX_IMAGES) {
-      const attempt = async (paramKey) => {
-        let out = [];
-        let url = new URL("https://graph.mapillary.com/images");
-        url.searchParams.set("fields", "id,computed_geometry");
-        url.searchParams.set(paramKey, username);
-        url.searchParams.set("limit", String(Math.min(PAGE_LIMIT, maxImages)));
-        url.searchParams.set("access_token", TOKEN);
+    // ===== Fetch ALL images for HKocen (strict) =====
+    async function fetchAllImagesForUser(username, maxImages = MAX_IMAGES) {
+      // Use creator_username ONLY (v4). Persist across paging.
+      const cutoffMs = Date.parse(CUTOFF_ISO);
+      let out = [];
+      let url = new URL("https://graph.mapillary.com/images");
+      url.searchParams.set("fields", "id,computed_geometry,captured_at,creator");
+      url.searchParams.set("creator_username", username);
+      url.searchParams.set("start_captured_at", CUTOFF_ISO);
+      url.searchParams.set("limit", String(Math.min(PAGE_LIMIT, maxImages)));
+      url.searchParams.set("access_token", TOKEN);
 
-        while (url && out.length < maxImages) {
-          status(`Loading pins by ${username}… ${out.length} fetched`);
-          const res = await fetch(url);
-          if (!res.ok) throw new Error(`API ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
-          const j = await res.json();
-          const data = Array.isArray(j.data) ? j.data : [];
-          for (const d of data) {
-            const c = d?.computed_geometry?.coordinates;
-            if (Array.isArray(c) && c.length === 2) out.push({ id: d.id, lng: c[0], lat: c[1] });
-            if (out.length >= maxImages) break;
-          }
-          const next = j?.paging?.next;
-          if (next && out.length < maxImages) {
-            url = new URL(next);
-            if (!url.searchParams.get("access_token")) url.searchParams.set("access_token", TOKEN);
-            if (!url.searchParams.get(paramKey)) url.searchParams.set(paramKey, username);
-            if (!url.searchParams.get("fields")) url.searchParams.set("fields", "id,computed_geometry");
-          } else {
-            url = null;
-          }
+      while (url && out.length < maxImages) {
+        status(`Fetching ${out.length}… (user=${username}, after=${CUTOFF_ISO})`);
+        const res = await fetch(url);
+        if (!res.ok) {
+          const t = await res.text().catch(()=>res.statusText);
+          throw new Error(`API ${res.status}: ${t}`);
         }
-        return out;
-      };
+        const j = await res.json();
+        const data = Array.isArray(j.data) ? j.data : [];
 
-      let items = await attempt("usernames");
-      if (items.length === 0) items = await attempt("creator_username");
-      status(`Pins loaded: ${items.length}`);
-      return items;
+        for (const d of data) {
+          const c = d?.computed_geometry?.coordinates;
+          const ts = d?.captured_at ? Date.parse(d.captured_at) : NaN;
+          // Extra client-side guard: only accept if creator.username === USERNAME
+          const creatorName = d?.creator?.username || "";
+          if (!Array.isArray(c) || c.length !== 2) continue;
+          if (!Number.isNaN(ts) && ts < cutoffMs) continue;
+          if (creatorName && creatorName !== username) continue;
+          out.push({ id: d.id, lng: c[0], lat: c[1], captured_at: d.captured_at || "" });
+          if (out.length >= maxImages) break;
+        }
+
+        const next = j?.paging?.next;
+        if (next && out.length < maxImages) {
+          url = new URL(next);
+          // Ensure critical params stick on the next page
+          if (!url.searchParams.get("access_token"))       url.searchParams.set("access_token", TOKEN);
+          if (!url.searchParams.get("creator_username"))   url.searchParams.set("creator_username", username);
+          if (!url.searchParams.get("fields"))             url.searchParams.set("fields", "id,computed_geometry,captured_at,creator");
+          if (!url.searchParams.get("start_captured_at"))  url.searchParams.set("start_captured_at", CUTOFF_ISO);
+        } else {
+          url = null;
+        }
+      }
+      return out;
     }
 
-    // ===== Add pins to map (NO clustering) =====
-    function addPinsToMap(items) {
+    // ===== Render (no clustering) =====
+    function renderPins(items) {
       const features = items.map(it => ({
         type: "Feature",
         geometry: { type: "Point", coordinates: [it.lng, it.lat] },
-        properties: { id: it.id }
+        properties: { id: it.id, captured_at: it.captured_at }
       }));
       const geojson = { type: "FeatureCollection", features };
 
-      // Clean up old layers/sources if reloading
-      ["pins-dots"].forEach(id => { if (map.getLayer(id)) map.removeLayer(id); });
+      if (map.getLayer("pins-dots")) map.removeLayer("pins-dots");
       if (map.getSource("pins")) map.removeSource("pins");
 
       map.addSource("pins", { type: "geojson", data: geojson });
 
-      // Single-dot style for every image
       map.addLayer({
         id: "pins-dots",
         type: "circle",
@@ -189,50 +201,43 @@
         paint: {
           "circle-color": "#1b5e20",
           "circle-opacity": 0.95,
-          "circle-radius": [
-            "interpolate", ["linear"], ["zoom"],
-            3, 2,
-            8, 3,
-            12, 4,
-            19, 6
-          ],
+          "circle-radius": ["interpolate", ["linear"], ["zoom"], 3, 2, 8, 3, 12, 4, 19, 6],
           "circle-stroke-width": 2,
           "circle-stroke-color": "#9cff9c"
         }
       });
 
-      // Click: move viewer to that image
       map.on("click", "pins-dots", (e) => {
         const f = map.queryRenderedFeatures(e.point, { layers: ["pins-dots"] })[0];
         if (f?.properties?.id) viewer.moveTo(f.properties.id).catch(()=>{});
       });
-
       map.on("mouseenter", "pins-dots", ()=> map.getCanvas().style.cursor = "pointer");
       map.on("mouseleave", "pins-dots", ()=> map.getCanvas().style.cursor = "");
 
-      // Fit to all pins
       if (features.length) {
         const b = new maplibregl.LngLatBounds(features[0].geometry.coordinates, features[0].geometry.coordinates);
         for (const ft of features) b.extend(ft.geometry.coordinates);
         map.fitBounds(b, { padding: 30, maxZoom: 12 });
+        status(`Showing ${features.length} pins for ${USERNAME} (after ${CUTOFF_ISO})`);
       } else {
-        status("No pins found for this user.");
+        status(`No pins for ${USERNAME} after ${CUTOFF_ISO}. Try an earlier ?after=YYYY-MM-DD.`, true);
       }
     }
 
-    function addPinsWhenReady(items) {
-      if (map.loaded() || map.isStyleLoaded?.()) addPinsToMap(items);
-      else map.once("load", () => addPinsToMap(items));
+    function renderWhenReady(items) {
+      if (map.loaded() || map.isStyleLoaded?.()) renderPins(items);
+      else map.once("load", () => renderPins(items));
     }
 
     // ===== Boot =====
     (async () => {
       try {
-        const items = await fetchAllImagesByUser(USERNAME, MAX_IMAGES);
-        addPinsWhenReady(items);
+        status(`Cutoff: ${CUTOFF_ISO}\nFetching images for ${USERNAME}…`);
+        const items = await fetchAllImagesForUser(USERNAME, MAX_IMAGES);
+        renderWhenReady(items);
       } catch (err) {
-        status("Failed to load pins");
         console.error(err);
+        status(`Failed to load pins: ${err.message || err}`, true);
       }
     })();
   </script>
