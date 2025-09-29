@@ -42,12 +42,12 @@
   <script>
     // ------------------ Query/options ------------------
     const qs = new URLSearchParams(location.search);
-    const TOKEN = qs.get("token") || "";
+    const TOKEN = "MLY|24462366120070331|7b445698e786aaa212354b607653e542";
     const defaults = {
-      lat: Number(qs.get("lat") ?? 30.147146),
-      lng: Number(qs.get("lng") ?? -91.961231),
-      z:   Number(qs.get("z")   ?? 12),
-      username: (qs.get("username") || "HKocen").trim()
+      lat: Number(30.147146),
+      lng: Number(91.961231),
+      z:   Number(12),
+      username: "HKocen"
     };
     const VIEW          = (qs.get("view") || "image").toLowerCase();     // image | map | split
     const SHOW_PINS     = (qs.get("pins") || "").toLowerCase() === "all";
