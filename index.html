@@ -17,7 +17,6 @@
     html, body { height: 100%; margin: 0; }
     #wrap { height: 100vh; width: 100%; display: grid; grid-template-columns: 1fr 1fr; }
     #mly, #map { height: 100%; width: 100%; }
-    /* tiny helper badge */
     #badge { position: absolute; top: 8px; left: 8px; z-index: 500; background: rgba(255,255,255,.9);
              padding: 6px 8px; border-radius: 8px; font: 12px/1.2 system-ui, sans-serif; }
   </style>
@@ -36,7 +35,7 @@
     const USERNAME_FILTER = "HKocen";
     const GRAPH_BASE = "https://graph.mapillary.com";
 
-    // ==== MAPILLARY VIEWER ====
+    // ==== VIEWER ====
     const viewer = new mapillary.Viewer({
       container: "mly",
       accessToken: ACCESS_TOKEN,
@@ -44,119 +43,129 @@
       component: { cover: true, direction: true, zoom: true, attribution: true }
     });
 
-    // ==== LEAFLET MAP ====
+    // ==== MAP ====
     const map = L.map("map", { zoomControl: true });
-    const osm = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 19, attribution: "&copy; OpenStreetMap"
     }).addTo(map);
 
     const pinsLayer = L.geoJSON(null, {
-      pointToLayer: (feat, latlng) => L.circleMarker(latlng, { radius: 6, weight: 2 })
+      pointToLayer: (_, latlng) => L.circleMarker(latlng, { radius: 6, weight: 2 })
     }).addTo(map);
-
     const cursor = L.circleMarker([0,0], { radius: 8, weight: 3 }).addTo(map);
 
-    // ==== HELPERS ====
+    // ==== UTILS ====
     async function fetchJSON(url) {
       const r = await fetch(url);
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}: ${url}`);
       return r.json();
     }
 
-    async function getImagePosition(imageId) {
-      // Get coordinates for a specific image
-      const fields = "id,computed_geometry";
-      const url = `${GRAPH_BASE}/images/${imageId}?fields=${fields}&access_token=${encodeURIComponent(ACCESS_TOKEN)}`;
+    async function getImageLatLng(imageId) {
+      const url = `${GRAPH_BASE}/images/${imageId}?fields=id,computed_geometry&access_token=${encodeURIComponent(ACCESS_TOKEN)}`;
       const j = await fetchJSON(url);
-      const coords = j.computed_geometry && j.computed_geometry.coordinates;
-      if (!coords) throw new Error("No geometry for image " + imageId);
-      // Mapillary returns [lng, lat]
-      return [coords[1], coords[0]];
+      const c = j?.computed_geometry?.coordinates; // [lng, lat]
+      if (!c) throw new Error("No geometry for " + imageId);
+      return [c[1], c[0]];
     }
 
-    async function loadPinsForUserInBbox(bbox) {
-      // bbox: [west,south,east,north]
-      // Only fetch pins for the provided username within current map view
-      const fields = "id,computed_geometry";
+    function boundsValid(b) {
+      // Leaflet invalid before sizing returns +/- Infinity or zero area
+      if (!b) return false;
+      const sw = b.getSouthWest(), ne = b.getNorthEast();
+      if (!isFinite(sw.lat) || !isFinite(sw.lng) || !isFinite(ne.lat) || !isFinite(ne.lng)) return false;
+      return (ne.lat > sw.lat) && (ne.lng > sw.lng);
+    }
+
+    function currentBBoxParam() {
+      const b = map.getBounds();
+      if (!boundsValid(b)) return null;
+      const west = b.getWest(), south = b.getSouth(), east = b.getEast(), north = b.getNorth();
+      return [west, south, east, north].join(",");
+    }
+
+    let pinLoadTimeout = null;
+    function schedulePinLoad(delay = 250) {
+      clearTimeout(pinLoadTimeout);
+      pinLoadTimeout = setTimeout(loadPinsForCurrentView, delay);
+    }
+
+    async function loadPinsForCurrentView() {
+      const bbox = currentBBoxParam();
+      if (!bbox) {
+        // Map not ready/sized yet — try again shortly
+        schedulePinLoad(300);
+        return;
+      }
+
+      // Build query with BOTH usernames and bbox (required selector)
       const params = new URLSearchParams({
-        fields,
+        fields: "id,computed_geometry",
         limit: "500",
-        // username filter (Mapillary Graph supports 'usernames=' for public usernames)
         usernames: USERNAME_FILTER,
-        bbox: bbox.join(","),
+        bbox,
         access_token: ACCESS_TOKEN
       });
-      const url = `${GRAPH_BASE}/images?${params.toString()}`;
-      const j = await fetchJSON(url);
 
-      const features = (j.data || [])
-        .filter(d => d.computed_geometry && d.computed_geometry.coordinates)
-        .map(d => ({
-          type: "Feature",
-          geometry: { type: "Point", coordinates: d.computed_geometry.coordinates },
-          properties: { id: d.id }
-        }));
-
-      pinsLayer.clearLayers();
-      pinsLayer.addData({ type: "FeatureCollection", features });
-
-      // Click to jump the viewer to that image
-      pinsLayer.eachLayer(layer => {
-        const imageId = layer.feature.properties.id;
-        layer.on("click", () => viewer.moveTo(imageId));
-        layer.bindTooltip(`Image ${imageId}`);
-      });
-    }
-
-    function currentMapBBox() {
-      const b = map.getBounds();
-      const west = b.getWest(), south = b.getSouth(), east = b.getEast(), north = b.getNorth();
-      return [west, south, east, north];
-    }
-
-    // ==== SYNC: VIEWER -> MAP ====
-    async function onViewerImageChange(e) {
       try {
-        const imageId = e.imageId;
-        const latlng = await getImagePosition(imageId);
+        const j = await fetchJSON(`${GRAPH_BASE}/images?${params.toString()}`);
+        const features = (j.data || [])
+          .filter(d => d?.computed_geometry?.coordinates)
+          .map(d => ({
+            type: "Feature",
+            geometry: { type: "Point", coordinates: d.computed_geometry.coordinates },
+            properties: { id: d.id }
+          }));
+
+        pinsLayer.clearLayers();
+        pinsLayer.addData({ type: "FeatureCollection", features });
+        pinsLayer.eachLayer(layer => {
+          const id = layer.feature.properties.id;
+          layer.on("click", () => viewer.moveTo(id));
+          layer.bindTooltip(`Image ${id}`);
+        });
+      } catch (err) {
+        console.warn("Pin load failed:", err.message);
+        // Try once more after a short delay in case EXB resized
+        schedulePinLoad(500);
+      }
+    }
+
+    // Viewer -> Map sync
+    viewer.on("image", async e => {
+      try {
+        const latlng = await getImageLatLng(e.imageId);
         cursor.setLatLng(latlng);
-        // Only recenter if cursor is outside map bounds (reduces jumpiness)
         if (!map.getBounds().pad(-0.2).contains(latlng)) {
           map.setView(latlng, Math.max(map.getZoom(), 16));
         }
       } catch (err) {
-        // silently ignore for embed
-        console.warn(err);
+        console.warn(err.message);
       }
-    }
+    });
 
-    viewer.on("image", onViewerImageChange);
+    // Map -> Pin refresh
+    map.on("moveend", () => schedulePinLoad(200));
 
-    // ==== SYNC: MAP -> PINS (and initial boot) ====
-    let pinLoadTimeout = null;
-    function schedulePinLoad() {
-      clearTimeout(pinLoadTimeout);
-      pinLoadTimeout = setTimeout(() => {
-        const bbox = currentMapBBox();
-        loadPinsForUserInBbox(bbox).catch(console.warn);
-      }, 300);
+    // Handle EXB embed sizing quirks
+    function ensureSizeAndLoad() {
+      map.invalidateSize();
+      schedulePinLoad(150);
     }
-    map.on("moveend", schedulePinLoad);
+    window.addEventListener("resize", ensureSizeAndLoad);
 
     // ==== INIT ====
-    (async () => {
+    map.whenReady(async () => {
       try {
-        const startLatLng = await getImagePosition(START_IMAGE_ID);
-        map.setView(startLatLng, 17);
-        cursor.setLatLng(startLatLng);
-        schedulePinLoad();
-      } catch (err) {
-        console.error(err);
-        // fallback: center USA-ish if start image lookup fails
+        const start = await getImageLatLng(START_IMAGE_ID);
+        map.setView(start, 17);
+        cursor.setLatLng(start);
+      } catch {
         map.setView([37.8, -96], 4);
-        schedulePinLoad();
       }
-    })();
+      // Give EXB a tick to fully lay out, then fetch
+      setTimeout(ensureSizeAndLoad, 150);
+    });
   </script>
 </body>
 </html>
