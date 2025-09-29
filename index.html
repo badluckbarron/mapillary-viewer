@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Mapillary viewer + map (split)</title>
+  <title>Mapillary: all pins by HKocen (split viewer + map)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -15,211 +15,249 @@
 
   <style>
     html, body { height: 100%; margin: 0; }
-    #app { position: relative; height: 100vh; width: 100%; }
+    #wrap { position: relative; height: 100vh; width: 100%; }
+    #viewer, #map { position: absolute; top: 0; height: 100%; }
+    #viewer { left: 0; width: 61.8%; }
+    #map    { right: 0; width: calc(38.2% - 2px); margin-left: 2px; }
+    #msg { position: absolute; left: 8px; top: 8px; z-index: 1000;
+           background: rgba(0,0,0,.6); color:#fff; padding:6px 10px; border-radius:6px;
+           font: 13px/1.3 system-ui, sans-serif; }
   </style>
 </head>
 <body>
-  <div id="app"></div>
+  <div id="wrap">
+    <div id="viewer"></div>
+    <div id="map"></div>
+    <div id="msg">Loading…</div>
+  </div>
 
   <script>
-    // === Your config ===
-    const MLY_ACCESS_TOKEN = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
-    const START_IMAGE_ID   = "744575191439794";
-    const START_CENTER     = { lng: -91.965153, lat: 30.138307 }; // approx start center
+    // ===== Config =====
+    const TOKEN     = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
+    const START_ID  = "744575191439794";
+    const USERNAME  = "HKocen";
 
-    // Use MapLibre via the mapboxgl alias so the code matches your sample
-    window.mapboxgl = window.maplibregl;
+    // Cap total images to avoid overloading the browser (raise if you like)
+    const MAX_IMAGES   = 10000;   // safety cap
+    const PAGE_LIMIT   = 1000;    // Graph API per-page limit
 
-    // Raster OSM style with maxzoom 19 (fix for “blank map at z18”)
-    const OSM_RASTER_STYLE = {
-      "version": 8,
-      "name": "OSM Raster",
-      "sources": {
-        "osm": {
-          "type": "raster",
-          "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-          "tileSize": 256,
-          "minzoom": 0,
-          "maxzoom": 19,
-          "attribution": "© OpenStreetMap contributors"
-        }
-      },
-      "layers": [
-        { "id": "background", "type": "background", "paint": { "background-color": "#e6f2d8" } },
-        { "id": "osm-tiles",  "type": "raster",     "source": "osm" }
-      ]
-    };
+    const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
 
-    // ===== Helpers to create split containers (viewer left, map right) =====
-    function makeContainers(container) {
-      const boundingRect = container.getBoundingClientRect();
-      const height = `calc(100vh - ${boundingRect.top}px)`;
+    // ===== Viewer =====
+    const viewer = new mapillary.Viewer({
+      container: "viewer",
+      accessToken: TOKEN,
+      imageId: START_ID,
+      component: { cover: false, direction: true, zoom: true, attribution: true }
+    });
 
-      const viewerContainer = document.createElement('div');
-      viewerContainer.style.position = 'absolute';
-      viewerContainer.style.left = '0';
-      viewerContainer.style.top = '0';
-      viewerContainer.style.height = height;
-      viewerContainer.style.width = '61.8%';
-
-      const mapContainer = document.createElement('div');
-      mapContainer.style.position = 'absolute';
-      mapContainer.style.right = '0';
-      mapContainer.style.top = '0';
-      mapContainer.style.height = height;
-      mapContainer.style.width = 'calc(38.2% - 2px)';
-      mapContainer.style.marginLeft = '2px';
-
-      container.appendChild(viewerContainer);
-      container.appendChild(mapContainer);
-
-      return { viewer: viewerContainer, map: mapContainer };
+    // Keep a small “camera wedge” + position marker on the map
+    function makeArcPath(fovDeg) {
+      const radius = 45, cx = 50, cy = 50, rad = Math.PI/180 * fovDeg;
+      const a0 = -Math.PI/2 - rad/2, a1 = a0 + rad;
+      const x0 = cx + radius * Math.cos(a0), y0 = cy + radius * Math.sin(a0);
+      const x1 = cx + radius * Math.cos(a1), y1 = cy + radius * Math.sin(a1);
+      return `M ${cx} ${cy} L ${x0} ${y0} A ${radius} ${radius} 0 0 1 ${x1} ${y1} Z`;
     }
-
-    function makeMapboxMarker(options) {
-      const size = `${2 * options.radius}px`;
-      const circle = document.createElement('div');
-      circle.style.border = `3px solid ${options.color}`;
-      circle.style.backgroundColor = 'rgba(255, 255, 255, 0.6)';
-      circle.style.height = size;
-      circle.style.borderRadius = '50%';
-      circle.style.width = size;
-      return new mapboxgl.Marker({ element: circle, rotationAlignment: 'map' });
-    }
-
-    const RAD2DEG = 180 / Math.PI;
-    const DEG2RAD = Math.PI / 180;
-    const rotateArc = (bearing) => `rotateZ(${bearing}deg)`;
-
-    function makeArc(fovDeg) {
-      const radius = 45, centerX = 50, centerY = 50;
-      const fovRad = DEG2RAD * fovDeg;
-      const arcStart = -Math.PI / 2 - fovRad / 2;
-      const arcEnd   = arcStart + fovRad;
-
-      const startX = centerX + radius * Math.cos(arcStart);
-      const startY = centerY + radius * Math.sin(arcStart);
-      const endX   = centerX + radius * Math.cos(arcEnd);
-      const endY   = centerY + radius * Math.sin(arcEnd);
-
-      const center = `M ${centerX} ${centerY}`;
-      const line   = `L ${startX} ${startY}`;
-      const arc    = `A ${radius} ${radius} 0 0 1 ${endX} ${endY}`;
-      return `${center} ${line} ${arc} Z`;
-    }
-
     function makeCamera(bearingDeg, fovDeg) {
-      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      path.setAttribute('d', makeArc(fovDeg));
-      path.setAttribute('fill', 'yellow');
-      path.setAttribute('fill-opacity', '0.5');
-      path.setAttribute('stroke', 'black');
-      path.setAttribute('stroke-width', '1');
-      path.setAttribute('stroke-linejoin', 'round');
-
-      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.setAttribute('viewBox', '0 0 100 100');
-      svg.appendChild(path);
-      svg.style.height = '100%';
-      svg.style.width  = '100%';
-      svg.style.transform = rotateArc(bearingDeg);
-
-      const container = document.createElement('div');
-      container.style.height = '200px';
-      container.style.width  = '200px';
+      const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+      path.setAttribute('d', makeArcPath(fovDeg));
+      path.setAttribute('fill','yellow'); path.setAttribute('fill-opacity','0.5');
+      path.setAttribute('stroke','black'); path.setAttribute('stroke-width','1');
+      path.setAttribute('stroke-linejoin','round');
+      const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+      svg.setAttribute('viewBox','0 0 100 100'); svg.appendChild(path);
+      svg.style.height='100%'; svg.style.width='100%'; svg.style.transform = `rotateZ(${bearingDeg}deg)`;
+      const container = document.createElement('div'); container.style.height='200px'; container.style.width='200px';
       container.appendChild(svg);
       return container;
     }
 
-    // ===== App =====
-    let viewer, map;
+    // ===== Map (MapLibre GL) with OSM raster style (z up to 19) =====
+    const OSM_RASTER_STYLE = {
+      "version": 8, "name": "OSM Raster",
+      "sources": {
+        "osm": {
+          "type":"raster",
+          "tiles":["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+          "tileSize":256,"minzoom":0,"maxzoom":19,
+          "attribution":"© OpenStreetMap contributors"
+        }
+      },
+      "layers":[
+        {"id":"bg","type":"background","paint":{"background-color":"#e6f2d8"}},
+        {"id":"osm","type":"raster","source":"osm"}
+      ]
+    };
 
-    async function init() {
-      const app = document.getElementById('app');
-      const containers = makeContainers(app);
+    const map = new maplibregl.Map({
+      container: "map",
+      style: OSM_RASTER_STYLE,
+      center: [-91.965153, 30.138307],
+      zoom: 5,
+      pitch: 0
+    });
 
-      // Mapillary viewer
-      const ViewerCtor = (window.mapillary && window.mapillary.Viewer) || window.Viewer;
-      viewer = new ViewerCtor({
-        accessToken: MLY_ACCESS_TOKEN,
-        component: { cover: false },
-        container: containers.viewer,
-      });
-      viewer.moveTo(START_IMAGE_ID).catch(err => console.warn(err));
+    const cameraEl = makeCamera(0, 90);
+    const cameraMarker = new maplibregl.Marker({ element: cameraEl, rotationAlignment: "map" });
+    const posDot = document.createElement('div');
+    posDot.style.cssText="width:14px;height:14px;border:3px solid #ff2a6d;border-radius:50%;background:#fff9";
+    const positionMarker = new maplibregl.Marker({ element: posDot, rotationAlignment: "map" });
 
-      // Map (MapLibre) with embedded OSM raster style
-      map = new mapboxgl.Map({
-        container: containers.map,
-        style: OSM_RASTER_STYLE,
-        center: [START_CENTER.lng, START_CENTER.lat],
-        zoom: 18,
-        pitch: 45,
-      });
+    // Sync viewer -> map position + camera wedge
+    async function syncPosition() {
+      try {
+        const p = await viewer.getPosition();      // {lng, lat}
+        const pov = await viewer.getPointOfView(); // {bearing, tilt, roll}
+        positionMarker.setLngLat([p.lng, p.lat]).addTo(map);
+        cameraMarker.setLngLat([p.lng, p.lat]).addTo(map);
+        const svg = cameraEl.querySelector('svg'); svg.style.transform = `rotateZ(${pov.bearing}deg)`;
+      } catch {}
+    }
+    viewer.on('load', syncPosition);
+    viewer.on('image', syncPosition);
+    viewer.on('position', syncPosition);
+    viewer.on('pov',     syncPosition);
+    viewer.on('fov', async () => {
+      const vc = viewer.getContainer();
+      const vFov = Math.PI/180 * (await viewer.getFieldOfView());
+      const aspect = vc.offsetHeight ? vc.offsetWidth / vc.offsetHeight : 0;
+      const hFovDeg = Math.atan(aspect * Math.tan(0.5*vFov)) * 2 * 180/Math.PI;
+      const path = cameraEl.querySelector('path');
+      path.setAttribute('d', makeArcPath(hFovDeg));
+    });
+    window.addEventListener('resize', ()=>viewer.emit && viewer.emit('fov'));
 
-      // Camera wedge + markers
-      const camera = makeCamera(0, 90);
-      const cameraMarker   = new mapboxgl.Marker({ element: camera, rotationAlignment: 'map' });
-      const originalMarker = makeMapboxMarker({ radius: 14, color: '#f00' });
-      const lngLatMarker   = makeMapboxMarker({ radius: 14, color: '#00f' });
-      const positionMarker = makeMapboxMarker({ radius: 10, color: '#f0f' });
+    // ===== Fetch ALL images by username (paged) =====
+    async function fetchAllImagesByUser(username, maxImages = MAX_IMAGES) {
+      let out = [];
+      let url = new URL("https://graph.mapillary.com/images");
+      url.searchParams.set("fields", "id,computed_geometry");
+      url.searchParams.set("usernames", username);
+      url.searchParams.set("limit", String(Math.min(PAGE_LIMIT, maxImages)));
+      url.searchParams.set("access_token", TOKEN);
 
-      const onImage = (image) => {
-        const lngLat = [image.lngLat.lng, image.lngLat.lat];
-        lngLatMarker.setLngLat(lngLat);
-        if (!map.getBounds().contains(lngLat)) map.setCenter(lngLat);
-
-        const originalPos = [image.originalLngLat.lng, image.originalLngLat.lat];
-        originalMarker.setLngLat(originalPos);
-      };
-
-      const onFov = async () => {
-        const viewerContainer = viewer.getContainer();
-        const h = viewerContainer.offsetHeight;
-        const w = viewerContainer.offsetWidth;
-        const aspect = h === 0 ? 0 : w / h;
-
-        const verticalFov   = DEG2RAD * (await viewer.getFieldOfView());
-        const horizontalFov = RAD2DEG * Math.atan(aspect * Math.tan(0.5 * verticalFov)) * 2;
-
-        const path = camera.querySelector('path');
-        path.setAttribute('d', makeArc(horizontalFov));
-      };
-
-      const onPov = async () => {
-        const pov = await viewer.getPointOfView();
-        const svg = camera.querySelector('svg');
-        svg.style.transform = rotateArc(pov.bearing);
-      };
-
-      const onPosition = async () => {
-        const position = await viewer.getPosition();
-        const pos = [position.lng, position.lat];
-        positionMarker.setLngLat(pos);
-        cameraMarker.setLngLat(pos);
-      };
-
-      viewer.on('load', async () => {
-        const image = await viewer.getImage();
-        onImage(image);
-
-        await onFov();
-        await onPov();
-        await onPosition();
-
-        lngLatMarker.addTo(map);
-        originalMarker.addTo(map);
-        positionMarker.addTo(map);
-        cameraMarker.addTo(map);
-      });
-
-      viewer.on('image', (event) => onImage(event.image));
-      viewer.on('position', onPosition);
-      viewer.on('fov', onFov);
-      window.addEventListener('resize', onFov);
-      viewer.on('pov', onPov);
+      while (url && out.length < maxImages) {
+        status(`Loading pins by ${username}… ${out.length} fetched`);
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`API ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
+        const j = await res.json();
+        const data = Array.isArray(j.data) ? j.data : [];
+        for (const d of data) {
+          const c = d?.computed_geometry?.coordinates;
+          if (Array.isArray(c) && c.length === 2) out.push({ id: d.id, lng: c[0], lat: c[1] });
+          if (out.length >= maxImages) break;
+        }
+        const next = j?.paging?.next;
+        if (next && out.length < maxImages) {
+          url = new URL(next);
+          // ensure token sticks around
+          if (!url.searchParams.get("access_token")) url.searchParams.set("access_token", TOKEN);
+        } else {
+          url = null;
+        }
+      }
+      status(`Pins loaded: ${out.length}`);
+      return out;
     }
 
-    init();
+    // ===== Add pins to map as a clustered GeoJSON source =====
+    function addPinsToMap(items) {
+      const features = items.map(it => ({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [it.lng, it.lat] },
+        properties: { id: it.id }
+      }));
+      const geojson = { type: "FeatureCollection", features };
+
+      if (map.getSource("pins")) map.removeSource("pins");
+      map.addSource("pins", {
+        type: "geojson",
+        data: geojson,
+        cluster: true,
+        clusterRadius: 40,
+        clusterMaxZoom: 14
+      });
+
+      // clusters
+      map.addLayer({
+        id: "clusters",
+        type: "circle",
+        source: "pins",
+        filter: ["has", "point_count"],
+        paint: {
+          "circle-color": "#2b7a0b",
+          "circle-opacity": 0.85,
+          "circle-stroke-width": 2,
+          "circle-stroke-color": "#0b3d0b",
+          "circle-radius": [
+            "step", ["get","point_count"], 14, 50, 18, 200, 24
+          ]
+        }
+      });
+      map.addLayer({
+        id: "cluster-count",
+        type: "symbol",
+        source: "pins",
+        filter: ["has", "point_count"],
+        layout: {
+          "text-field": ["to-string", ["get","point_count"]],
+          "text-size": 12
+        },
+        paint: { "text-color": "#ffffff" }
+      });
+
+      // single points
+      map.addLayer({
+        id: "unclustered",
+        type: "circle",
+        source: "pins",
+        filter: ["!", ["has", "point_count"]],
+        paint: {
+          "circle-color": "#1b5e20",
+          "circle-radius": 5,
+          "circle-stroke-width": 2,
+          "circle-stroke-color": "#9cff9c"
+        }
+      });
+
+      // Click handlers
+      map.on("click", "clusters", async (e) => {
+        const f = map.queryRenderedFeatures(e.point, { layers: ["clusters"] })[0];
+        const src = map.getSource("pins");
+        const zoom = await src.getClusterExpansionZoom(f.properties.cluster_id);
+        map.easeTo({ center: f.geometry.coordinates, zoom });
+      });
+
+      map.on("click", "unclustered", (e) => {
+        const f = map.queryRenderedFeatures(e.point, { layers: ["unclustered"] })[0];
+        const id = f.properties.id;
+        viewer.moveTo(id).catch(()=>{});
+      });
+
+      map.on("mouseenter", "clusters", ()=> map.getCanvas().style.cursor = "pointer");
+      map.on("mouseleave", "clusters", ()=> map.getCanvas().style.cursor = "");
+      map.on("mouseenter", "unclustered", ()=> map.getCanvas().style.cursor = "pointer");
+      map.on("mouseleave", "unclustered", ()=> map.getCanvas().style.cursor = "");
+
+      // Fit to all pins
+      if (features.length) {
+        const b = new maplibregl.LngLatBounds(features[0].geometry.coordinates, features[0].geometry.coordinates);
+        for (const ft of features) b.extend(ft.geometry.coordinates);
+        map.fitBounds(b, { padding: 30, maxZoom: 12 });
+      }
+    }
+
+    // ===== Boot =====
+    (async () => {
+      try {
+        const items = await fetchAllImagesByUser(USERNAME, MAX_IMAGES);
+        map.on("load", () => addPinsToMap(items));
+      } catch (err) {
+        status("Failed to load pins");
+        console.error(err);
+      }
+    })();
   </script>
 </body>
 </html>
