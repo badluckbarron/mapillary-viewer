@@ -42,24 +42,20 @@
   <script>
     // ------------------ Query/options ------------------
     const qs = new URLSearchParams(location.search);
-
-    // RAW token may be URL-encoded (MLY%7C...); decode to MLY|...
     const RAW_TOKEN = "MLY%7C24462366120070331%7C7b445698e786aaa212354b607653e542";
     const TOKEN = decodeURIComponent(RAW_TOKEN);
-
     const defaults = {
       lat: Number(30.138307),
       lng: Number(-91.965153),
-      z:   Number(10),
+      z:   Number(16),
       username: "HKocen"
     };
-
     const VIEW          = "split";                   // image | map | split
-    const SHOW_PINS     = true;                      // show pins
-    const FOV_DEG       = Number(60);                // visual field-of-view
+    const SHOW_PINS     = "all";                     // show pins
+    const FOV_DEG       = Number(60);                // visual field-of-view (not bearing)
     const DEBUG         = qs.get("debug") === "1";
-    const MAX_PINS      = Number(1000);              // cap at 1000 to avoid API limit errors
-    // Start wedge/bearing WEST (270°) to match west-facing default imagery
+    const MAX_PINS      = Number(2000);
+    // Start wedge/bearing WEST (270°) to match your default imagery
     const START_BEARING = ((Number(qs.get("bearing")) || 270) + 360) % 360;
     const FOLLOW_MAP    = (qs.get("follow") ?? "1") !== "0";
 
@@ -146,78 +142,70 @@
       url.searchParams.set("radius", Math.max(25, Math.round(zoomToMeters(defaults.z))));
       url.searchParams.set("limit","1");
       if(defaults.username) url.searchParams.set("creator_username", defaults.username);
-      const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}}); 
-      if(!res.ok){ 
-        const t = await res.text().catch(()=>res.statusText);
-        throw new Error(`API ${res.status} ${t}`);
-      }
+      const res=await fetch(url,{headers:{Authorization:`OAuth ${TOKEN}`}}); if(!res.ok) throw new Error(`API ${res.status}`);
       const j=await res.json(); return j?.data?.[0] ?? null;
     }
 
     async function getImageLatLng(imageId){
       const u=new URL(`https://graph.mapillary.com/${imageId}`);
       u.searchParams.set("fields","computed_geometry");
-      const res=await fetch(u,{headers:{Authorization:`OAuth ${TOKEN}`}}); 
-      if(!res.ok) return null;
+      const res=await fetch(u,{headers:{Authorization:`OAuth ${TOKEN}`}}); if(!res.ok) return null;
       const j=await res.json();
       const c=j?.computed_geometry?.coordinates;
       return Array.isArray(c) && c.length===2 ? [c[1], c[0]] : null;
     }
 
-    async function fetchImagesInBbox({bbox, cap=MAX_PINS}){
-      // Keep page size at or under 1000 to avoid 400s.
-      const PAGE = Math.min(1000, cap);
-      let out = [];
-      let url = new URL("https://graph.mapillary.com/images");
-      url.searchParams.set("fields","id,computed_geometry");
-      url.searchParams.set("bbox", bbox.join(","));
-      url.searchParams.set("limit", String(Math.min(PAGE, cap)));
-      if(defaults.username) url.searchParams.set("creator_username", defaults.username);
+    // ------------------ Navigation ------------------
+    let viewer, navLock=0;
+    let compassOffset=0;              // wedgeBearing = (compassOffset + ROT_SIGN*rot) % 360
+    let stickyBearing=START_BEARING;  // keep angle across photos (starts WEST)
+    let suspendWatcher=false;         // pause live updates during anchoring
 
-      while(url && out.length < cap){
-        const res = await fetch(url, { headers:{ Authorization:`OAuth ${TOKEN}` }});
-        if(!res.ok){
-          const t = await res.text().catch(()=>res.statusText);
-          throw new Error(`API ${res.status} ${t}`);
-        }
-        const j = await res.json();
-        if(Array.isArray(j.data)) out.push(...j.data);
-        const next = j?.paging?.next;
-        if(!next || out.length >= cap) break;
-        url = new URL(next);
-        url.searchParams.set("limit", String(Math.min(PAGE, cap - out.length)));
+    async function reanchorToSticky(){
+      suspendWatcher = true;
+      await nextFrame(); // ensure new image is mounted
+      const {rot, src} = getCompassRotation(); // quick read is fine here
+      if(rot!=null){
+        compassOffset = ((stickyBearing - ROT_SIGN * rot) % 360 + 360) % 360;
+        const p=marker.getLatLng();
+        drawOrientation(p.lat, p.lng, stickyBearing, FOV_DEG, 50);
+        if (DEBUG) dbg(`reanchor\nrot=${rot?.toFixed?.(1)}°\nsticky=${stickyBearing.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°\nsrc=${src}\nrotSign=${ROT_SIGN}`);
       }
-      return out.slice(0, cap);
+      suspendWatcher = false;
     }
 
-    async function drawPinsForView(){
-      if(!TOKEN || !SHOW_PINS) return;
-      status("Loading user pins in view…");
+    function startCompassWatcher(){
+      setInterval(()=>{
+        if(suspendWatcher) return;
+        const {rot, src} = getCompassRotation();
+        if(rot==null) return;
+        const bearing = (compassOffset + ROT_SIGN * rot) % 360;
+        stickyBearing = bearing;
+        const pos=marker.getLatLng();
+        drawOrientation(pos.lat, pos.lng, bearing, FOV_DEG, 50);
+        if (DEBUG) dbg(`live\nrot=${rot.toFixed(1)}°\nbearing=${bearing.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°\nsrc=${src}\nrotSign=${ROT_SIGN}`);
+      }, 120);
+    }
+
+    async function gotoImage(id, latlngHint){
+      const my=++navLock;
+      try{ await viewer.setFilter(["all"]); }catch{}
       try{
-        const images = await fetchImagesInBbox({bbox:bboxFromMap(map)});
-        pinLayer.clearLayers(); pinsById = new Map(); selectedPin = null;
+        suspendWatcher = true;
+        await viewer.moveTo(id);
 
-        for(const img of images){
-          const c=img?.computed_geometry?.coordinates; if(!c) continue;
-          const latlng=[c[1],c[0]];
-          const pin = L.circleMarker(latlng, defaultPinStyle)
-            .on('click', async (e)=>{
-              L.DomEvent.stop(e);
-              selectPinById(img.id);
-              await gotoImage(img.id, latlng);
-            })
-            .addTo(pinLayer);
-          pinsById.set(img.id, pin);
+        if (SHOW_PINS) selectPinById(id);
+
+        // Update marker/map
+        const ll = latlngHint || await getImageLatLng(id);
+        if(ll){
+          marker.setLatLng(ll);
+          if(FOLLOW_MAP && VIEW!=='image') map.setView(ll, map.getZoom(), {animate:true});
         }
-        status(`Pins: ${images.length}`);
-      }catch(e){
-        console.error(e);
-        status(`Error loading pins (${e.message || e})`);
+      } finally {
+        if(navLock===my) navLock=0;
       }
     }
-
-    let pinTimer=null;
-    map.on('moveend', ()=>{ if(!SHOW_PINS) return; clearTimeout(pinTimer); pinTimer=setTimeout(drawPinsForView,300); });
 
     // ------------------ Compass reading (DOM) ------------------
     function getRotationDeg(rootEl){
@@ -254,72 +242,6 @@
         {rot:null, src:'none'}
       );
     }
-    async function readStableCompassRotation(maxWaitMs=3500){
-      const t0=performance.now(); let last=null, stable=0; let result={rot:null,src:'none'};
-      while(performance.now()-t0<maxWaitMs){
-        const r=getCompassRotation();
-        if(r.rot!=null){
-          const diff= last==null ? 999 : Math.abs(((r.rot-last+540)%360)-180);
-          if(diff<0.5){ if(++stable>=3) return r; }
-          else { stable=0; last=r.rot; result=r; }
-        }
-        await sleep(100);
-      }
-      return result;
-    }
-
-    // ------------------ Sticky wedge logic ------------------
-    let viewer, navLock=0;
-    let compassOffset=0;              // wedgeBearing = (compassOffset + ROT_SIGN*rot) % 360
-    let stickyBearing=START_BEARING;  // keep angle across photos (starts WEST)
-    let suspendWatcher=false;         // pause live updates during anchoring
-
-    async function reanchorToSticky(){
-      suspendWatcher = true;
-      await nextFrame(); // ensure new image is mounted
-      const {rot, src} = getCompassRotation(); // quick read is fine here
-      if(rot!=null){
-        compassOffset = ((stickyBearing - ROT_SIGN * rot) % 360 + 360) % 360;
-        const p=marker.getLatLng();
-        drawOrientation(p.lat, p.lng, stickyBearing, FOV_DEG, 50);
-        if (DEBUG) dbg(`reanchor\nrot=${rot?.toFixed?.(1)}°\nsticky=${stickyBearing.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°\nsrc=${src}\nrotSign=${ROT_SIGN}`);
-      }
-      suspendWatcher = false;
-    }
-
-    function startCompassWatcher(){
-      setInterval(()=>{
-        if(suspendWatcher) return;
-        const {rot, src} = getCompassRotation();
-        if(rot==null) return;
-        const bearing = (compassOffset + ROT_SIGN * rot) % 360;
-        stickyBearing = bearing;
-        const pos=marker.getLatLng();
-        drawOrientation(pos.lat, pos.lng, bearing, FOV_DEG, 50);
-        if (DEBUG) dbg(`live\nrot=${rot.toFixed(1)}°\nbearing=${bearing.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°\nsrc=${src}\nrotSign=${ROT_SIGN}`);
-      }, 120);
-    }
-
-    // ------------------ Navigation ------------------
-    async function gotoImage(id, latlngHint){
-      const my=++navLock;
-      try{ await viewer.setFilter(["all"]); }catch{}
-      try{
-        suspendWatcher = true;
-        await viewer.moveTo(id);
-
-        if (SHOW_PINS) selectPinById(id);
-
-        // Update marker/map
-        const ll = latlngHint || await getImageLatLng(id);
-        if(ll){
-          marker.setLatLng(ll);
-          if(FOLLOW_MAP && VIEW!=='image') map.setView(ll, map.getZoom(), {animate:true});
-        }
-      } finally {
-        if(navLock===my) navLock=0;
-      }
-    }
 
     // ------------------ Init ------------------
     (async function init(){
@@ -328,7 +250,6 @@
       const ViewerCtor=M && M.Viewer;
       if(!ViewerCtor){ status("Mapillary library failed to load."); return; }
 
-      // Use decoded token for viewer too
       viewer=new ViewerCtor({ container:"mly", accessToken:TOKEN });
       try{ viewer.setFieldOfView(FOV_DEG); }catch{}
 
@@ -363,7 +284,29 @@
       status("");
 
       startCompassWatcher();
-      if(SHOW_PINS) drawPinsForView();
+      if(SHOW_PINS) {
+        // draw after we’ve centered on the first image to avoid extra work
+        const b = bboxFromMap(map);
+        await (async function drawPinsForView(){
+          try{
+            const images=await fetchImagesInBbox({bbox:b});
+            pinLayer.clearLayers(); pinsById = new Map(); selectedPin = null;
+            for(const img of images){
+              const c=img?.computed_geometry?.coordinates; if(!c) continue;
+              const latlng=[c[1],c[0]];
+              const pin = L.circleMarker(latlng, defaultPinStyle)
+                .on('click', async (e)=>{
+                  L.DomEvent.stop(e);
+                  selectPinById(img.id);
+                  await gotoImage(img.id, latlng);
+                })
+                .addTo(pinLayer);
+              pinsById.set(img.id, pin);
+            }
+            status(`Pins: ${images.length}`);
+          }catch(e){ console.error(e); status("Error loading pins."); }
+        })();
+      }
     })();
   </script>
 </body>
